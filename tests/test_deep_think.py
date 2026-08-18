@@ -270,6 +270,7 @@ class RequestConfigurationTests(unittest.TestCase):
         )
         self.assertIs(captured["openai"]["api_key"], provider)
         self.assertEqual(captured["openai"]["max_retries"], 0)
+        self.assertEqual(captured["openai"]["timeout"], 3600)
 
 
 class RetryTests(unittest.TestCase):

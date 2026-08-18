@@ -15,6 +15,7 @@ Use this reference when maintaining or debugging the runner.
 - Storage: `store=False`
 - Output: `max_output_tokens=128000`, `text.verbosity=high`
 - Truncation: disabled
+- Client request timeout: 3,600 seconds
 - SDK retries: disabled with `max_retries=0`; the runner owns retry policy
 
 Pass the bearer token provider callable to `OpenAI(api_key=...)`. Do not read,
