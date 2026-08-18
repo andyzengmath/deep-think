@@ -75,9 +75,11 @@ class FakeResponse:
 
 
 class FakeResponses:
-    def __init__(self, responses):
+    def __init__(self, responses, retrieved=None):
         self.queued = list(responses)
+        self.retrieved = list(retrieved or [])
         self.calls = []
+        self.retrieve_calls = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
@@ -86,10 +88,17 @@ class FakeResponses:
             raise result
         return result
 
+    def retrieve(self, response_id):
+        self.retrieve_calls.append(response_id)
+        result = self.retrieved.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
 
 class FakeClient:
-    def __init__(self, responses):
-        self.responses = FakeResponses(responses)
+    def __init__(self, responses, retrieved=None):
+        self.responses = FakeResponses(responses, retrieved)
 
 
 def make_status_error(status_code, code, *, headers=None, message="Azure error"):
@@ -167,6 +176,7 @@ class RequestConfigurationTests(unittest.TestCase):
         self.assertEqual(request["text"], {"verbosity": "high"})
         self.assertEqual(request["max_output_tokens"], 128_000)
         self.assertEqual(request["truncation"], "disabled")
+        self.assertTrue(request["background"])
         self.assertEqual(request["instructions"], deep_think.DEEP_MATH_INSTRUCTIONS)
 
     def test_client_reports_missing_endpoint_configuration(self):
@@ -274,6 +284,83 @@ class RequestConfigurationTests(unittest.TestCase):
 
 
 class RetryTests(unittest.TestCase):
+    def test_background_response_is_polled_without_resubmitting(self):
+        deep_think = load_module()
+        queued = FakeResponse(
+            "resp-background",
+            "",
+            status="queued",
+            incomplete_reason=None,
+        )
+        in_progress = FakeResponse(
+            "resp-background",
+            "",
+            status="in_progress",
+            incomplete_reason=None,
+        )
+        complete = FakeResponse("resp-background", "Complete proof.")
+        client = FakeClient([queued], [in_progress, complete])
+        sleeps = []
+
+        outcome = deep_think.request_response(
+            client,
+            {
+                "model": "gpt-5.6-sol",
+                "input": "Prove it.",
+                "background": True,
+            },
+            purpose="answer",
+            poll_interval=0,
+            sleep=sleeps.append,
+        )
+
+        self.assertIs(outcome.response, complete)
+        self.assertEqual(outcome.retry_count, 0)
+        self.assertEqual(len(client.responses.calls), 1)
+        self.assertEqual(
+            client.responses.retrieve_calls,
+            ["resp-background", "resp-background"],
+        )
+        self.assertEqual(sleeps, [0, 0])
+
+    def test_transient_poll_error_retries_retrieve_without_resubmitting(self):
+        deep_think = load_module()
+        queued = FakeResponse(
+            "resp-background",
+            "",
+            status="queued",
+            incomplete_reason=None,
+        )
+        transient = make_status_error(500, "server_error")
+        complete = FakeResponse("resp-background", "Complete proof.")
+        client = FakeClient([queued], [transient, complete])
+        events = []
+
+        outcome = deep_think.request_response(
+            client,
+            {
+                "model": "gpt-5.6-sol",
+                "input": "Prove it.",
+                "background": True,
+            },
+            purpose="answer",
+            max_attempts=2,
+            base_delay=0,
+            poll_interval=0,
+            sleep=lambda _delay: None,
+            random_value=lambda: 0,
+            on_retry=events.append,
+        )
+
+        self.assertIs(outcome.response, complete)
+        self.assertEqual(outcome.retry_count, 1)
+        self.assertEqual(len(client.responses.calls), 1)
+        self.assertEqual(
+            client.responses.retrieve_calls,
+            ["resp-background", "resp-background"],
+        )
+        self.assertIn("HTTP 500", events[0].reason)
+
     def test_non_finite_retry_delay_is_rejected_before_api_call(self):
         deep_think = load_module()
         client = FakeClient([FakeResponse("resp-unused", "Must not be used.")])

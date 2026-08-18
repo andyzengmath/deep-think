@@ -13,6 +13,8 @@ Use this reference when maintaining or debugging the runner.
 - Reasoning: `{"mode": "pro", "effort": "max", "context": "all_turns",
   "summary": "auto"}`
 - Storage: `store=False`
+- Execution: `background=True`; poll every two seconds while status is
+  `queued` or `in_progress`
 - Output: `max_output_tokens=128000`, `text.verbosity=high`
 - Truncation: disabled
 - Client request timeout: 3,600 seconds
@@ -38,6 +40,12 @@ Make at most three total attempts by default. Retry:
 - HTTP 408, 409, 429, and 5xx responses.
 - Azure `server_error`, `too_many_requests`, `rate_limit_exceeded`,
   `no_capacity`, `timeout`, and `temporarily_unavailable` response codes.
+
+Submit long-running responses in background mode.  After the initial request
+returns an ID, retry transient polling failures against that ID rather than
+creating a duplicate response.  Treat `completed`, `failed`, `cancelled`, and
+`incomplete` as terminal states and pass them through the ordinary validation
+and recovery policy.
 
 Honor `x-should-retry`, `Retry-After`, and `retry-after-ms`. Otherwise use
 exponential backoff with bounded jitter. Never retry refusals, authentication or
@@ -85,6 +93,7 @@ next successful write.
 Verified 2026-08-18:
 
 - [Azure OpenAI Responses API](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/responses)
+- [OpenAI Responses background mode](https://developers.openai.com/api/docs/guides/background)
 - [Azure OpenAI reasoning models](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning)
 - [GPT-5.6 Sol model limits](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
 - [GPT-5.6 pro mode and max effort](https://developers.openai.com/api/docs/guides/latest-model)

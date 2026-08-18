@@ -78,6 +78,12 @@ or other permanent 4xx failures. Validate every response field that later code
 uses before leaving the application retry loop so malformed HTTP 200 payloads
 cannot escape as late `TypeError` or `AttributeError` crashes.
 
+Normal and rollover requests run with Responses API background mode enabled.
+Poll the returned response ID while its status is `queued` or `in_progress`.
+Retry transient retrieval failures without resubmitting the original job; this
+prevents duplicate maximum-effort requests and avoids long synchronous HTTP
+timeouts.
+
 Allow one reactive recovery. If Azure rejects a committed context or a
 context-constrained answer exhausts its output budget, summarize the last
 committed volume and replay the prompt in a new volume. A proactive rollover

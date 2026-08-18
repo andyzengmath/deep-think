@@ -8,6 +8,7 @@ The runner uses:
 
 - Microsoft Entra ID authentication through `DefaultAzureCredential`
 - Responses API `pro` mode with maximum reasoning effort
+- Background execution and polling for long-running reasoning requests
 - A 1,050,000-token model context with conservative local budget enforcement
 - Structured Markdown answers and version-controlled local transcripts
 - Stateless encrypted-context replay and automatic summarized rollover

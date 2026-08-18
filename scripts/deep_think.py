@@ -82,6 +82,7 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_RETRY_BASE_DELAY = 1.0
 DEFAULT_RETRY_MAX_DELAY = 30.0
 DEFAULT_REQUEST_TIMEOUT = 3600.0
+DEFAULT_POLL_INTERVAL = 2.0
 VISIBLE_SUMMARY_CHUNK_BYTES = 400_000
 VISIBLE_CHUNK_OUTPUT_TOKENS = MAX_OUTPUT_TOKENS
 VISIBLE_SUMMARY_MAX_REDUCTION_ROUNDS = 4
@@ -476,6 +477,96 @@ def create_client(
     )
 
 
+def _poll_background_response(
+    client,
+    response,
+    *,
+    purpose,
+    max_attempts,
+    base_delay,
+    max_delay,
+    poll_interval,
+    sleep,
+    random_value,
+    on_retry,
+):
+    try:
+        from openai import (
+            APIConnectionError,
+            APIResponseValidationError,
+            APIStatusError,
+        )
+    except ImportError as error:
+        raise DeepThinkError(
+            "Install dependencies with: "
+            "python -m pip install --upgrade openai azure-identity"
+        ) from error
+
+    retry_count = 0
+    while _response_status(response) in {"queued", "in_progress"}:
+        response_id = _response_id(response)
+        sleep(poll_interval)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                retrieved = client.responses.retrieve(response_id)
+            except APIResponseValidationError as error:
+                reason = "malformed Azure response"
+                retry_error = error
+            except APIConnectionError as error:
+                reason = type(error).__name__
+                retry_error = error
+            except APIStatusError as error:
+                status_code, code, message = _status_error_details(error)
+                reason = f"Azure HTTP {status_code}"
+                if code:
+                    reason += f" ({code})"
+                if not _status_error_is_retryable(error):
+                    raise DeepThinkError(
+                        f"{purpose.capitalize()} poll failed without retry: "
+                        f"{reason}: {message}"
+                    ) from error
+                retry_error = error
+            else:
+                try:
+                    retrieved_id = _response_id(retrieved)
+                    _response_status(retrieved)
+                    if retrieved_id != response_id:
+                        raise MalformedResponseError(
+                            "Background response ID changed while polling."
+                        )
+                except MalformedResponseError as error:
+                    reason = "malformed Azure response"
+                    retry_error = error
+                else:
+                    response = retrieved
+                    retry_count += attempt - 1
+                    break
+
+            if attempt >= max_attempts:
+                raise DeepThinkError(
+                    f"{purpose.capitalize()} poll failed after "
+                    f"{attempt} attempts: {reason}"
+                ) from retry_error
+            delay = _retry_delay(
+                retry_error,
+                attempt,
+                base_delay,
+                max_delay,
+                random_value,
+            )
+            _retry_event(
+                f"{purpose} poll",
+                attempt,
+                max_attempts,
+                reason,
+                delay,
+                on_retry,
+            )
+            sleep(delay)
+
+    return response, retry_count
+
+
 def request_response(
     client,
     request,
@@ -487,8 +578,15 @@ def request_response(
     sleep=time.sleep,
     random_value=random.random,
     on_retry=None,
+    poll_interval=DEFAULT_POLL_INTERVAL,
 ):
     _validate_retry_settings(max_attempts, base_delay, max_delay)
+    if (
+        not isinstance(poll_interval, (int, float))
+        or not math.isfinite(poll_interval)
+        or poll_interval < 0
+    ):
+        raise DeepThinkError("Background poll interval must be a finite number.")
     try:
         from openai import (
             APIConnectionError,
@@ -502,6 +600,7 @@ def request_response(
         ) from error
 
     request_has_encrypted_content = _request_contains_encrypted_content(request)
+    poll_retry_count = 0
     for attempt in range(1, max_attempts + 1):
         try:
             response = client.responses.create(**request)
@@ -594,6 +693,19 @@ def request_response(
             sleep(delay)
             continue
         try:
+            response, retries = _poll_background_response(
+                client,
+                response,
+                purpose=purpose,
+                max_attempts=max_attempts,
+                base_delay=base_delay,
+                max_delay=max_delay,
+                poll_interval=poll_interval,
+                sleep=sleep,
+                random_value=random_value,
+                on_retry=on_retry,
+            )
+            poll_retry_count += retries
             refusal = _response_refusal_text(response)
             if refusal is not None:
                 raise DeepThinkError(
@@ -606,7 +718,10 @@ def request_response(
                 _response_id(response)
                 _response_usage(response)
                 _response_output(response)
-                return RequestOutcome(response, attempt - 1)
+                return RequestOutcome(
+                    response,
+                    attempt - 1 + poll_retry_count,
+                )
             if status == "completed" and attempt < max_attempts:
                 delay = _retry_delay(
                     None,
@@ -726,6 +841,7 @@ def build_response_request(
         "text": {"verbosity": "high"},
         "max_output_tokens": max_output_tokens,
         "truncation": "disabled",
+        "background": True,
     }
 
 
