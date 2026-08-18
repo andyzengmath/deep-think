@@ -1997,6 +1997,36 @@ class PersistenceTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
+    def test_cli_reconfigures_cp1252_stdout_to_utf8(self):
+        deep_think = load_module()
+        client = FakeClient([FakeResponse("resp-cli", "Proof complete. ∎")])
+        raw_stdout = io.BytesIO()
+        stdout = io.TextIOWrapper(raw_stdout, encoding="cp1252")
+        stderr = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            exit_code = deep_think.main(
+                [
+                    "ask",
+                    "--project",
+                    "cli-unicode",
+                    "--title",
+                    "CLI Unicode",
+                    "--prompt",
+                    "Prove it.",
+                    "--root",
+                    str(Path(temporary_directory) / "transcripts"),
+                ],
+                client_factory=lambda _endpoint: client,
+                stdout=stdout,
+                stderr=stderr,
+            )
+            stdout.flush()
+            output = raw_stdout.getvalue().decode("utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.splitlines(), ["Proof complete. ∎"])
+
     def test_ask_reads_prompt_file_and_prints_structured_result(self):
         deep_think = load_module()
         client = FakeClient(

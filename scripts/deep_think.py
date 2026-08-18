@@ -2055,6 +2055,8 @@ def main(
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
+    if hasattr(stdout, "reconfigure"):
+        stdout.reconfigure(encoding="utf-8")
     args = _build_parser().parse_args(argv)
 
     try:
