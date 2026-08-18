@@ -14,7 +14,8 @@ The runner uses:
 - Bounded retries, malformed-response validation, integrity checks, and
   visible-transcript recovery
 
-No API keys are accepted or stored.
+No API keys are accepted or stored. The repository contains no Azure resource
+endpoint, access token, client secret, tenant identifier, or client identifier.
 
 ## Install in a project
 
@@ -36,17 +37,23 @@ mathematical constructions, or theory building, read and follow
 reasoning.
 ```
 
-## Authenticate
+## Configure and authenticate
 
-Use Microsoft Entra ID locally:
+The Azure resource endpoint is intentionally not committed. Configure it in
+the current shell, then authenticate with Microsoft Entra ID:
 
 ```powershell
 az login
-$env:AZURE_OPENAI_ENDPOINT = "https://aoai-l-eastus2.services.ai.azure.com/openai/v1"
-$env:AZURE_OPENAI_DEPLOYMENT = "gpt-5.6-sol"
+$env:AZURE_OPENAI_ENDPOINT = Read-Host "Azure OpenAI v1 endpoint"
+$env:AZURE_OPENAI_DEPLOYMENT = Read-Host "Azure OpenAI deployment name"
 ```
 
-Managed identity can replace `az login` in Azure environments.
+`AZURE_OPENAI_ENDPOINT` is required. Managed identity can replace `az login`
+in Azure environments. Do not append tokens, credentials, query parameters, or
+fragments to the endpoint.
+
+See [CONFIGURATION.md](CONFIGURATION.md) for role assignment, local shell,
+managed identity, CI, validation, and troubleshooting instructions.
 
 ## Run
 
@@ -81,5 +88,6 @@ ruff format --check ".github\skills\deep-think"
 ```
 
 See [SKILL.md](SKILL.md) for the complete agent workflow and
+[CONFIGURATION.md](CONFIGURATION.md) for secure setup, and
 [references/azure-openai.md](references/azure-openai.md) for the verified API
 contract and context policy.

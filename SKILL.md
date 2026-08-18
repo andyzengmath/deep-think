@@ -19,14 +19,15 @@ turns.
    python -m pip install --upgrade -r ".github\skills\deep-think\scripts\requirements.txt"
    ```
 
-3. Authenticate with Microsoft Entra ID through `DefaultAzureCredential`. Use
-   `az login` for local development or a managed identity in Azure. Never add an
-   API key.
-4. Keep the default endpoint and deployment unless the environment differs:
+3. Follow [CONFIGURATION.md](CONFIGURATION.md) to grant the required Azure role
+   and authenticate through `DefaultAzureCredential`. Use `az login` for local
+   development or a managed identity in Azure. Never add an API key.
+4. Configure the resource-specific endpoint and deployment in the current
+   shell. The endpoint has no committed default:
 
    ```powershell
-   $env:AZURE_OPENAI_ENDPOINT = "https://aoai-l-eastus2.services.ai.azure.com/openai/v1"
-   $env:AZURE_OPENAI_DEPLOYMENT = "gpt-5.6-sol"
+   $env:AZURE_OPENAI_ENDPOINT = Read-Host "Azure OpenAI v1 endpoint"
+   $env:AZURE_OPENAI_DEPLOYMENT = Read-Host "Azure OpenAI deployment name"
    ```
 
 Read [references/azure-openai.md](references/azure-openai.md) only when changing

@@ -4,3 +4,10 @@ __pycache__/
 .venv/
 deep-think-transcripts/
 .deep-think.lock
+.env
+.env.*
+*.local
+*.local.*
+*.key
+*.pem
+*.pfx

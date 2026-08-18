@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DEEP_MATH_INSTRUCTIONS = """You are a deep mathematical research partner.
 Work on open problems, difficult proofs, and complex theoretical constructions.
@@ -83,7 +84,6 @@ DEFAULT_RETRY_MAX_DELAY = 30.0
 VISIBLE_SUMMARY_CHUNK_BYTES = 400_000
 VISIBLE_CHUNK_OUTPUT_TOKENS = MAX_OUTPUT_TOKENS
 VISIBLE_SUMMARY_MAX_REDUCTION_ROUNDS = 4
-DEFAULT_ENDPOINT = "https://aoai-l-eastus2.services.ai.azure.com/openai/v1"
 DEFAULT_DEPLOYMENT = "gpt-5.6-sol"
 ENTRA_SCOPE = "https://ai.azure.com/.default"
 STATE_SCHEMA = "deep-think-state"
@@ -416,12 +416,32 @@ def _retry_event(purpose, attempt, max_attempts, reason, delay, on_retry):
 
 
 def create_client(
-    endpoint=DEFAULT_ENDPOINT,
+    endpoint,
     *,
     credential_factory=None,
     token_provider_factory=None,
     openai_factory=None,
 ):
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise DeepThinkError(
+            "Azure OpenAI endpoint is required. Set AZURE_OPENAI_ENDPOINT "
+            "or pass --endpoint."
+        )
+    endpoint = endpoint.strip()
+    parsed_endpoint = urlsplit(endpoint)
+    if parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc:
+        raise DeepThinkError("Azure OpenAI endpoint must use HTTPS and include a host.")
+    if (
+        parsed_endpoint.username is not None
+        or parsed_endpoint.password is not None
+        or parsed_endpoint.query
+        or parsed_endpoint.fragment
+    ):
+        raise DeepThinkError(
+            "Azure OpenAI endpoint must not contain credentials, query parameters, "
+            "or fragments."
+        )
+
     if (
         credential_factory is None
         or token_provider_factory is None
@@ -442,9 +462,7 @@ def create_client(
         token_provider_factory = token_provider_factory or get_bearer_token_provider
         openai_factory = openai_factory or OpenAI
 
-    normalized_endpoint = endpoint.strip().rstrip("/") + "/"
-    if normalized_endpoint == "/":
-        raise DeepThinkError("Azure OpenAI endpoint must not be empty.")
+    normalized_endpoint = endpoint.rstrip("/") + "/"
     token_provider = token_provider_factory(
         credential_factory(),
         ENTRA_SCOPE,
@@ -1862,7 +1880,11 @@ def _build_parser():
     )
     ask.add_argument(
         "--endpoint",
-        default=os.getenv("AZURE_OPENAI_ENDPOINT", DEFAULT_ENDPOINT),
+        default=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        help=(
+            "Azure OpenAI v1 endpoint. Prefer the AZURE_OPENAI_ENDPOINT "
+            "environment variable."
+        ),
     )
     ask.add_argument(
         "--deployment",

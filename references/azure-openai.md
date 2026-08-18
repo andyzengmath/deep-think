@@ -2,10 +2,11 @@
 
 Use this reference when maintaining or debugging the runner.
 
-## Fixed request settings
+## Runtime configuration and fixed request settings
 
-- Endpoint: `https://aoai-l-eastus2.services.ai.azure.com/openai/v1/`
-- Deployment: `gpt-5.6-sol`
+- Endpoint: required from `AZURE_OPENAI_ENDPOINT` or `--endpoint`; no resource
+  URL is committed.
+- Deployment: `AZURE_OPENAI_DEPLOYMENT`, defaulting to `gpt-5.6-sol`.
 - API: Responses
 - Authentication: `DefaultAzureCredential` and
   `get_bearer_token_provider(..., "https://ai.azure.com/.default")`
@@ -18,6 +19,11 @@ Use this reference when maintaining or debugging the runner.
 
 Pass the bearer token provider callable to `OpenAI(api_key=...)`. Do not read,
 accept, or persist API keys.
+
+The endpoint must use HTTPS and include a host. The runner rejects endpoints
+containing user information, query parameters, or fragments so credentials
+cannot be smuggled through the URL. The fixed Entra scope above is a public
+protocol identifier, not a credential.
 
 ## Retry policy
 

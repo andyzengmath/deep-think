@@ -130,6 +130,22 @@ def make_validation_error():
 
 
 class RequestConfigurationTests(unittest.TestCase):
+    def test_parser_has_no_endpoint_when_environment_is_unconfigured(self):
+        deep_think = load_module()
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            args = deep_think._build_parser().parse_args(
+                [
+                    "ask",
+                    "--project",
+                    "configuration-test",
+                    "--prompt",
+                    "Test the configuration contract.",
+                ]
+            )
+
+        self.assertIsNone(args.endpoint)
+
     def test_request_uses_pro_mode_and_max_reasoning(self):
         deep_think = load_module()
         history = [{"role": "user", "content": "Solve the construction."}]
@@ -153,6 +169,76 @@ class RequestConfigurationTests(unittest.TestCase):
         self.assertEqual(request["truncation"], "disabled")
         self.assertEqual(request["instructions"], deep_think.DEEP_MATH_INSTRUCTIONS)
 
+    def test_client_reports_missing_endpoint_configuration(self):
+        deep_think = load_module()
+
+        with self.assertRaisesRegex(
+            deep_think.DeepThinkError,
+            "AZURE_OPENAI_ENDPOINT",
+        ):
+            deep_think.create_client(
+                None,
+                credential_factory=object,
+                token_provider_factory=lambda *_args: object(),
+                openai_factory=lambda **_kwargs: object(),
+            )
+
+    def test_client_rejects_credentials_embedded_in_endpoint(self):
+        deep_think = load_module()
+
+        with self.assertRaisesRegex(
+            deep_think.DeepThinkError,
+            "must not contain credentials",
+        ):
+            deep_think.create_client(
+                "https://identity@example.invalid/openai/v1",
+                credential_factory=object,
+                token_provider_factory=lambda *_args: object(),
+                openai_factory=lambda **_kwargs: object(),
+            )
+
+    def test_client_rejects_query_parameters_in_endpoint(self):
+        deep_think = load_module()
+
+        with self.assertRaisesRegex(
+            deep_think.DeepThinkError,
+            "must not contain credentials",
+        ):
+            deep_think.create_client(
+                "https://example.invalid/openai/v1?credential=value",
+                credential_factory=object,
+                token_provider_factory=lambda *_args: object(),
+                openai_factory=lambda **_kwargs: object(),
+            )
+
+    def test_client_rejects_fragment_in_endpoint(self):
+        deep_think = load_module()
+
+        with self.assertRaisesRegex(
+            deep_think.DeepThinkError,
+            "must not contain credentials",
+        ):
+            deep_think.create_client(
+                "https://example.invalid/openai/v1#credential",
+                credential_factory=object,
+                token_provider_factory=lambda *_args: object(),
+                openai_factory=lambda **_kwargs: object(),
+            )
+
+    def test_client_rejects_non_https_endpoint(self):
+        deep_think = load_module()
+
+        with self.assertRaisesRegex(
+            deep_think.DeepThinkError,
+            "must use HTTPS",
+        ):
+            deep_think.create_client(
+                "http://example.invalid/openai/v1",
+                credential_factory=object,
+                token_provider_factory=lambda *_args: object(),
+                openai_factory=lambda **_kwargs: object(),
+            )
+
     def test_client_uses_entra_token_provider_without_api_keys(self):
         deep_think = load_module()
         credential = object()
@@ -169,7 +255,7 @@ class RequestConfigurationTests(unittest.TestCase):
             return "client"
 
         client = deep_think.create_client(
-            "https://example.services.ai.azure.com/openai/v1",
+            "https://example.invalid/openai/v1",
             credential_factory=lambda: credential,
             token_provider_factory=token_provider_factory,
             openai_factory=openai_factory,
@@ -180,7 +266,7 @@ class RequestConfigurationTests(unittest.TestCase):
         self.assertEqual(captured["scope"], "https://ai.azure.com/.default")
         self.assertEqual(
             captured["openai"]["base_url"],
-            "https://example.services.ai.azure.com/openai/v1/",
+            "https://example.invalid/openai/v1/",
         )
         self.assertIs(captured["openai"]["api_key"], provider)
         self.assertEqual(captured["openai"]["max_retries"], 0)
