@@ -83,6 +83,10 @@ DEFAULT_RETRY_BASE_DELAY = 1.0
 DEFAULT_RETRY_MAX_DELAY = 30.0
 DEFAULT_REQUEST_TIMEOUT = 3600.0
 DEFAULT_POLL_INTERVAL = 2.0
+DEFAULT_RATE_LIMIT_FALLBACK_DEPLOYMENTS = (
+    "gpt-5.6-sol-nofilters",
+    "gpt-5.4-pro",
+)
 VISIBLE_SUMMARY_CHUNK_BYTES = 400_000
 VISIBLE_CHUNK_OUTPUT_TOKENS = MAX_OUTPUT_TOKENS
 VISIBLE_SUMMARY_MAX_REDUCTION_ROUNDS = 4
@@ -134,9 +138,10 @@ class RetryEvent:
 
 
 class RequestOutcome:
-    def __init__(self, response, retry_count):
+    def __init__(self, response, retry_count, deployment=None):
         self.response = response
         self.retry_count = retry_count
+        self.deployment = deployment
 
 
 RETRYABLE_RESPONSE_CODES = {
@@ -339,6 +344,9 @@ def _response_is_opaque_replay(response, request_has_encrypted_content):
 
 
 def _status_error_is_retryable(error):
+    status_code, _, _ = _status_error_details(error)
+    if status_code == 429:
+        return True
     response = getattr(error, "response", None)
     headers = getattr(response, "headers", {})
     directive = headers.get("x-should-retry")
@@ -346,10 +354,7 @@ def _status_error_is_retryable(error):
         return True
     if directive == "false":
         return False
-    status_code, _, _ = _status_error_details(error)
-    return status_code in {408, 409, 429} or (
-        status_code is not None and status_code >= 500
-    )
+    return status_code in {408, 409} or (status_code is not None and status_code >= 500)
 
 
 def _status_error_is_context_limit(error):
@@ -415,6 +420,27 @@ def _retry_event(purpose, attempt, max_attempts, reason, delay, on_retry):
     )
     if on_retry is not None:
         on_retry(event)
+
+
+def _rate_limit_deployment_chain(primary_deployment):
+    return tuple(
+        dict.fromkeys((primary_deployment, *DEFAULT_RATE_LIMIT_FALLBACK_DEPLOYMENTS))
+    )
+
+
+def _request_for_deployment(request, deployment):
+    routed_request = {**request, "model": deployment}
+    if deployment != "gpt-5.4-pro":
+        return routed_request
+
+    reasoning = request.get("reasoning")
+    if isinstance(reasoning, dict):
+        reasoning = dict(reasoning)
+        reasoning.pop("mode", None)
+        reasoning.pop("context", None)
+        reasoning["effort"] = "xhigh"
+        routed_request["reasoning"] = reasoning
+    return routed_request
 
 
 def create_client(
@@ -600,10 +626,14 @@ def request_response(
         ) from error
 
     request_has_encrypted_content = _request_contains_encrypted_content(request)
+    deployment_chain = _rate_limit_deployment_chain(request["model"])
+    deployment_index = 0
     poll_retry_count = 0
     for attempt in range(1, max_attempts + 1):
+        active_deployment = deployment_chain[deployment_index]
+        attempt_request = _request_for_deployment(request, active_deployment)
         try:
-            response = client.responses.create(**request)
+            response = client.responses.create(**attempt_request)
         except APIResponseValidationError as error:
             if attempt >= max_attempts:
                 raise DeepThinkError(
@@ -675,6 +705,11 @@ def request_response(
                     f"{purpose.capitalize()} request failed after "
                     f"{attempt} attempts: {reason}: {message}"
                 ) from error
+            if status_code == 429:
+                deployment_index = (deployment_index + 1) % len(deployment_chain)
+                reason += (
+                    f"; switching deployment to {deployment_chain[deployment_index]}"
+                )
             delay = _retry_delay(
                 error,
                 attempt,
@@ -721,6 +756,7 @@ def request_response(
                 return RequestOutcome(
                     response,
                     attempt - 1 + poll_retry_count,
+                    active_deployment,
                 )
             if status == "completed" and attempt < max_attempts:
                 delay = _retry_delay(
@@ -761,6 +797,16 @@ def request_response(
                 reason = (
                     "Azure response error (" + ", ".join(sorted(retryable_codes)) + ")"
                 )
+                if retryable_codes & {
+                    "too_many_requests",
+                    "rate_limit_exceeded",
+                    "no_capacity",
+                }:
+                    deployment_index = (deployment_index + 1) % len(deployment_chain)
+                    reason += (
+                        f"; switching deployment to "
+                        f"{deployment_chain[deployment_index]}"
+                    )
                 delay = _retry_delay(
                     None,
                     attempt,
@@ -1171,14 +1217,15 @@ def _volume_paths(project_dir, volume):
 
 
 def _transcript_header(state):
+    primary_mode, primary_effort = _reasoning_profile(state["deployment"])
     return (
         "---\n"
         f"schema: deep-think-transcript/v{STATE_VERSION}\n"
         f"project: {json.dumps(state['project'])}\n"
         f"volume: {state['volume']}\n"
-        f"model: {json.dumps(state['deployment'])}\n"
-        "reasoning-mode: pro\n"
-        "reasoning-effort: max\n"
+        f"primary-deployment: {json.dumps(state['deployment'])}\n"
+        f"primary-reasoning-mode: {primary_mode}\n"
+        f"primary-reasoning-effort: {primary_effort}\n"
         f"context-window-tokens: {CONTEXT_WINDOW_TOKENS}\n"
         f"rollover-tokens: {state['rollover_tokens']}\n"
         f"created-at: {json.dumps(state['created_at'])}\n"
@@ -1187,7 +1234,21 @@ def _transcript_header(state):
     )
 
 
-def _turn_markdown(turn, prompt, response, usage, retry_count=0):
+def _reasoning_profile(deployment):
+    if deployment == "gpt-5.4-pro":
+        return "not configurable", "xhigh"
+    return "pro", "max"
+
+
+def _turn_markdown(
+    turn,
+    prompt,
+    response,
+    usage,
+    retry_count=0,
+    deployment=None,
+):
+    reasoning_mode, reasoning_effort = _reasoning_profile(deployment)
     return (
         f"\n## Conversation {turn}\n\n"
         "### User\n\n"
@@ -1196,8 +1257,9 @@ def _turn_markdown(turn, prompt, response, usage, retry_count=0):
         f"{response.output_text.rstrip()}\n\n"
         "### Usage\n\n"
         f"- Response ID: `{response.id}`\n"
-        "- Reasoning mode: `pro`\n"
-        "- Reasoning effort: `max`\n"
+        f"- Deployment: `{deployment}`\n"
+        f"- Reasoning mode: `{reasoning_mode}`\n"
+        f"- Reasoning effort: `{reasoning_effort}`\n"
         f"- Input tokens: {usage['input_tokens']:,}\n"
         f"- Output tokens: {usage['output_tokens']:,}\n"
         f"- Reasoning tokens: {usage['reasoning_tokens']:,}\n"
@@ -1212,7 +1274,9 @@ def _rollover_markdown(
     usage,
     retry_count=0,
     recovery_note=None,
+    deployment=None,
 ):
+    reasoning_mode, reasoning_effort = _reasoning_profile(deployment)
     recovery_markdown = (
         f"\n> Recovery mode: {recovery_note}.\n" if recovery_note is not None else ""
     )
@@ -1222,6 +1286,9 @@ def _rollover_markdown(
         f"{response.output_text.rstrip()}\n\n"
         "### Summary usage\n\n"
         f"- Response ID: `{response.id}`\n"
+        f"- Deployment: `{deployment}`\n"
+        f"- Reasoning mode: `{reasoning_mode}`\n"
+        f"- Reasoning effort: `{reasoning_effort}`\n"
         f"- Input tokens: {usage['input_tokens']:,}\n"
         f"- Output tokens: {usage['output_tokens']:,}\n"
         f"- Reasoning tokens: {usage['reasoning_tokens']:,}\n"
@@ -1445,6 +1512,7 @@ def _request_visible_transcript_summary(
     return RequestOutcome(
         final_outcome.response,
         total_retry_count + final_outcome.retry_count,
+        final_outcome.deployment,
     )
 
 
@@ -1588,6 +1656,7 @@ def _rollover_volume(
         summary_usage,
         summary_outcome.retry_count,
         recovery_note,
+        summary_outcome.deployment,
     )
     state["cumulative_tokens"] += summary_usage["total_tokens"]
     state["volume"] += 1
@@ -1913,6 +1982,7 @@ def _run_turn_locked(
         response,
         usage,
         outcome.retry_count + recovery_count,
+        outcome.deployment,
     )
 
     pending_json[context_path] = updated_history

@@ -6,12 +6,16 @@ Use this reference when maintaining or debugging the runner.
 
 - Endpoint: required from `AZURE_OPENAI_ENDPOINT` or `--endpoint`; no resource
   URL is committed.
-- Deployment: `AZURE_OPENAI_DEPLOYMENT`, defaulting to `gpt-5.6-sol`.
+- Primary deployment: `AZURE_OPENAI_DEPLOYMENT`, defaulting to
+  `gpt-5.6-sol`.
+- 429 fallbacks: `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro`.
 - API: Responses
 - Authentication: `DefaultAzureCredential` and
   `get_bearer_token_provider(..., "https://ai.azure.com/.default")`
-- Reasoning: `{"mode": "pro", "effort": "max", "context": "all_turns",
-  "summary": "auto"}`
+- GPT-5.6 reasoning: `{"mode": "pro", "effort": "max",
+  "context": "all_turns", "summary": "auto"}`
+- GPT-5.4 Pro fallback reasoning: `{"effort": "xhigh",
+  "summary": "auto"}`; mode and all-turns context are not configurable there.
 - Storage: `store=False`
 - Execution: `background=True`; poll every two seconds while status is
   `queued` or `in_progress`
@@ -41,16 +45,26 @@ Make at most three total attempts by default. Retry:
 - Azure `server_error`, `too_many_requests`, `rate_limit_exceeded`,
   `no_capacity`, `timeout`, and `temporarily_unavailable` response codes.
 
+On a submission-level 429, advance through `gpt-5.6-sol`,
+`gpt-5.6-sol-nofilters`, and `gpt-5.4-pro`; cycle to the primary only if the
+configured attempt count leaves another attempt. A new logical request always
+starts on its primary deployment. Apply failover only before a response is
+accepted or after a terminal rate-limit response. A transient 429 while polling
+an existing background response retries retrieval of the same response ID and
+never creates a duplicate job.
+
 Submit long-running responses in background mode.  After the initial request
 returns an ID, retry transient polling failures against that ID rather than
 creating a duplicate response.  Treat `completed`, `failed`, `cancelled`, and
 `incomplete` as terminal states and pass them through the ordinary validation
 and recovery policy.
 
-Honor `x-should-retry`, `Retry-After`, and `retry-after-ms`. Otherwise use
-exponential backoff with bounded jitter. Never retry refusals, authentication or
-authorization failures, ordinary bad requests, or other permanent 4xx errors.
-Persist only the final complete response.
+Honor `x-should-retry`, `Retry-After`, and `retry-after-ms`, except that HTTP
+429 remains retryable even if `x-should-retry` is `false` so deployment
+failover and same-ID polling recovery cannot be disabled. Otherwise use
+exponential backoff with bounded jitter. Never retry refusals, authentication
+or authorization failures, ordinary bad requests, or other permanent 4xx
+errors. Persist only the final complete response.
 
 ## Context policy
 

@@ -14,6 +14,8 @@ The runner uses:
 - Stateless encrypted-context replay and automatic summarized rollover
 - Bounded retries, malformed-response validation, integrity checks, and
   visible-transcript recovery
+- Ordered 429 failover across `gpt-5.6-sol`,
+  `gpt-5.6-sol-nofilters`, and `gpt-5.4-pro`
 
 No API keys are accepted or stored. The repository contains no Azure resource
 endpoint, access token, client secret, tenant identifier, or client identifier.
@@ -52,6 +54,12 @@ $env:AZURE_OPENAI_DEPLOYMENT = Read-Host "Azure OpenAI deployment name"
 `AZURE_OPENAI_ENDPOINT` is required. Managed identity can replace `az login`
 in Azure environments. Do not append tokens, credentials, query parameters, or
 fragments to the endpoint.
+
+The primary deployment defaults to `gpt-5.6-sol`. On submission-level HTTP
+429s, the runner tries `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro`, within the
+same bounded attempt count. The 5.4 fallback omits unsupported reasoning mode
+and uses `xhigh`, its highest supported effort. Every new logical request starts
+again on the primary deployment.
 
 See [CONFIGURATION.md](CONFIGURATION.md) for role assignment, local shell,
 managed identity, CI, validation, and troubleshooting instructions.

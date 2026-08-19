@@ -33,9 +33,21 @@ runner requires HTTPS and normalizes the trailing slash.
 The deployment variable is optional when its name is `gpt-5.6-sol`; setting it
 explicitly makes the active deployment unambiguous.
 
+The built-in 429 fallback chain assumes the same resource also has deployments
+named `gpt-5.6-sol-nofilters` and `gpt-5.4-pro`. Missing fallback deployments do
+not affect normal primary requests, but a 429 failover will stop explicitly if
+Azure reports that a configured fallback does not exist. The 5.4 fallback uses
+`xhigh` reasoning without a reasoning mode because that deployment does not
+support the 5.6 `pro`/`max` profile.
+
 The values above last only for the current PowerShell process. If you automate
 them, use an operating-system, CI, or cloud configuration store outside the
 repository. Do not create a tracked setup script or `.env` file.
+
+An already-running terminal or agent process does not inherit user-level
+environment variables added later. Restart that terminal or agent after
+persisting `AZURE_OPENAI_ENDPOINT`, or set it explicitly in the current
+PowerShell session.
 
 ## Managed identity
 
@@ -96,10 +108,14 @@ When installed as a repository skill, prefix paths with
 ## Troubleshooting
 
 - **Missing endpoint:** set `AZURE_OPENAI_ENDPOINT` or pass `--endpoint`.
+- **Endpoint exists at user scope but the runner says it is missing:** restart
+  the terminal or agent process so it inherits the updated environment.
 - **HTTP 401:** refresh `az login` or check the managed/workload identity.
 - **HTTP 403:** verify the identity's data-plane role and resource scope.
 - **Deployment not found:** set `AZURE_OPENAI_DEPLOYMENT` to the deployment
   name, not the base model name unless they are identical.
+- **HTTP 429:** the runner tries `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro`,
+  and starts the next logical request back on the primary deployment.
 - **Credential chain selects the wrong account:** inspect `az account show`,
   choose the intended subscription, and log in again. Do not work around the
   issue by adding an API key.

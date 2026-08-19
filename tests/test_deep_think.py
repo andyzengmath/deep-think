@@ -416,7 +416,10 @@ class RetryTests(unittest.TestCase):
         throttled = make_status_error(
             429,
             "no_capacity",
-            headers={"retry-after": "2.5"},
+            headers={
+                "retry-after": "2.5",
+                "x-should-retry": "false",
+            },
         )
         complete = FakeResponse("resp-complete", "Complete proof.")
         client = FakeClient([throttled, complete])
@@ -436,9 +439,129 @@ class RetryTests(unittest.TestCase):
         self.assertIs(outcome.response, complete)
         self.assertEqual(outcome.retry_count, 1)
         self.assertEqual(len(client.responses.calls), 2)
+        self.assertEqual(
+            [call["model"] for call in client.responses.calls],
+            ["gpt-5.6-sol", "gpt-5.6-sol-nofilters"],
+        )
+        self.assertEqual(outcome.deployment, "gpt-5.6-sol-nofilters")
         self.assertEqual(sleeps, [2.5])
         self.assertIn("HTTP 429", events[0].reason)
         self.assertIn("no_capacity", events[0].reason)
+        self.assertIn(
+            "switching deployment to gpt-5.6-sol-nofilters",
+            events[0].reason,
+        )
+
+    def test_all_fallback_429s_switch_back_to_primary_deployment(self):
+        deep_think = load_module()
+        client = FakeClient(
+            [
+                make_status_error(429, "rate_limit_exceeded"),
+                make_status_error(429, "rate_limit_exceeded"),
+                make_status_error(429, "rate_limit_exceeded"),
+                FakeResponse("resp-complete", "Complete proof."),
+            ]
+        )
+
+        outcome = deep_think.request_response(
+            client,
+            {"model": "gpt-5.6-sol", "input": "Prove it."},
+            purpose="answer",
+            max_attempts=4,
+            base_delay=0,
+            sleep=lambda _delay: None,
+            random_value=lambda: 0,
+        )
+
+        self.assertEqual(
+            [call["model"] for call in client.responses.calls],
+            [
+                "gpt-5.6-sol",
+                "gpt-5.6-sol-nofilters",
+                "gpt-5.4-pro",
+                "gpt-5.6-sol",
+            ],
+        )
+        self.assertEqual(outcome.deployment, "gpt-5.6-sol")
+        self.assertEqual(outcome.retry_count, 3)
+
+    def test_5_4_fallback_uses_xhigh_without_reasoning_mode(self):
+        deep_think = load_module()
+        client = FakeClient(
+            [
+                make_status_error(429, "rate_limit_exceeded"),
+                make_status_error(429, "rate_limit_exceeded"),
+                FakeResponse("resp-complete", "Complete proof."),
+            ]
+        )
+
+        outcome = deep_think.request_response(
+            client,
+            {
+                "model": "gpt-5.6-sol",
+                "input": "Prove it.",
+                "reasoning": {
+                    "mode": "pro",
+                    "effort": "max",
+                    "context": "all_turns",
+                    "summary": "auto",
+                },
+            },
+            purpose="answer",
+            max_attempts=3,
+            base_delay=0,
+            sleep=lambda _delay: None,
+            random_value=lambda: 0,
+        )
+
+        self.assertEqual(outcome.deployment, "gpt-5.4-pro")
+        self.assertEqual(
+            client.responses.calls[2]["reasoning"],
+            {
+                "effort": "xhigh",
+                "summary": "auto",
+            },
+        )
+
+    def test_poll_429_does_not_resubmit_on_fallback_deployment(self):
+        deep_think = load_module()
+        queued = FakeResponse(
+            "resp-background",
+            "",
+            status="queued",
+            incomplete_reason=None,
+        )
+        throttled = make_status_error(
+            429,
+            "rate_limit_exceeded",
+            headers={"x-should-retry": "false"},
+        )
+        complete = FakeResponse("resp-background", "Complete proof.")
+        client = FakeClient([queued], [throttled, complete])
+
+        outcome = deep_think.request_response(
+            client,
+            {
+                "model": "gpt-5.6-sol",
+                "input": "Prove it.",
+                "background": True,
+            },
+            purpose="answer",
+            max_attempts=2,
+            base_delay=0,
+            poll_interval=0,
+            sleep=lambda _delay: None,
+            random_value=lambda: 0,
+        )
+
+        self.assertEqual(len(client.responses.calls), 1)
+        self.assertEqual(client.responses.calls[0]["model"], "gpt-5.6-sol")
+        self.assertEqual(
+            client.responses.retrieve_calls,
+            ["resp-background", "resp-background"],
+        )
+        self.assertEqual(outcome.deployment, "gpt-5.6-sol")
+        self.assertEqual(outcome.retry_count, 1)
 
     def test_malformed_azure_response_is_retried(self):
         deep_think = load_module()
@@ -799,6 +922,64 @@ class PersistenceTests(unittest.TestCase):
         self.assertNotIn("resp-empty", json.dumps(context))
         self.assertIn("Application retries: 1", transcript)
         self.assertEqual(len(events), 1)
+
+    def test_5_4_fallback_records_actual_reasoning_profile(self):
+        deep_think = load_module()
+        client = FakeClient(
+            [
+                make_status_error(429, "rate_limit_exceeded"),
+                make_status_error(429, "rate_limit_exceeded"),
+                FakeResponse("resp-complete", "Complete proof."),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            deep_think.run_turn(
+                client,
+                root=root,
+                project="fallback-transcript",
+                title="Fallback Transcript",
+                prompt="Prove the theorem.",
+                deployment="gpt-5.6-sol",
+                max_attempts=3,
+                retry_base_delay=0,
+                sleep=lambda _delay: None,
+                random_value=lambda: 0,
+            )
+            transcript = (
+                root / "fallback-transcript" / "0001-transcript.md"
+            ).read_text("utf-8")
+
+        self.assertIn("Deployment: `gpt-5.4-pro`", transcript)
+        self.assertIn("Reasoning mode: `not configurable`", transcript)
+        self.assertIn("Reasoning effort: `xhigh`", transcript)
+        self.assertIn('primary-deployment: "gpt-5.6-sol"', transcript)
+        self.assertIn("primary-reasoning-mode: pro", transcript)
+        self.assertIn("primary-reasoning-effort: max", transcript)
+        self.assertNotIn("\nmodel:", transcript)
+
+    def test_5_4_primary_records_its_effective_profile_in_frontmatter(self):
+        deep_think = load_module()
+        client = FakeClient([FakeResponse("resp-complete", "Complete proof.")])
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            deep_think.run_turn(
+                client,
+                root=root,
+                project="gpt54-primary-transcript",
+                title="GPT-5.4 Primary Transcript",
+                prompt="Prove the theorem.",
+                deployment="gpt-5.4-pro",
+            )
+            transcript = (
+                root / "gpt54-primary-transcript" / "0001-transcript.md"
+            ).read_text("utf-8")
+
+        self.assertIn('primary-deployment: "gpt-5.4-pro"', transcript)
+        self.assertIn("primary-reasoning-mode: not configurable", transcript)
+        self.assertIn("primary-reasoning-effort: xhigh", transcript)
 
     def test_context_error_forces_rollover_and_replays_prompt_once(self):
         deep_think = load_module()
