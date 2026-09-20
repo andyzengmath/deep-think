@@ -70,6 +70,19 @@ creating a duplicate response.  Treat `completed`, `failed`, `cancelled`, and
 `incomplete` as terminal states and pass them through the ordinary validation
 and recovery policy.
 
+Use a monotonic 3,600-second deadline for each accepted job, configurable with
+`--poll-timeout`. Successful polls do not refresh it. Cap sleeps, retry delays,
+and each SDK retrieval timeout to the remaining budget. Check the deadline
+between operations; in-flight credential/transport phases can finish later.
+On deadline or retrieval exhaustion, stop with the original response ID,
+deployment, and target ordinal; never cancel or resubmit automatically.
+The budget applies separately to answer, rollover, and chunk-summary jobs.
+
+For every retryable terminal response, report its ID, deployment, target,
+output budget, canonical request byte length and SHA-256, and the service error
+message. These diagnostics do not log the request content or authentication
+headers. A response-object `server_error` is distinct from an HTTP 500.
+
 Honor `x-should-retry`, `Retry-After`, and `retry-after-ms`, except that HTTP
 429 remains retryable even if `x-should-retry` is `false` so deployment
 failover and same-ID polling recovery cannot be disabled. Otherwise use
@@ -91,6 +104,8 @@ service-side context errors still follow the bounded recovery policy.
 Existing projects on built-in older deployments can adopt the new default:
 verify state and file checksums first, retain all history, record the primary
 upgrade, and persist it only through the ordinary successful-turn commit.
+When service-error recovery is explicitly enabled, a completed rollover is
+also a persistence checkpoint, even if the following answer fails.
 
 Persist every Responses output item locally, including encrypted reasoning
 items, and replay them with the next user message. Use 900,000 tokens as the
@@ -109,6 +124,20 @@ transcript that exceeds one request in 400,000-byte chunks and synthesize the
 chunk summaries; never silently truncate it. A proactive rollover does not
 consume the single reactive recovery allowance. Treat a second reactive context
 rejection after rollover as terminal.
+
+The optional `--recover-service-errors` policy allows a terminal
+`status="failed"` / `error.code="server_error"` after bounded failover to trigger
+one visible-transcript rollover for an existing volume. It also applies to the
+ordinary full-context rollover-summary request. It does not handle submission
+HTTP errors, polling failures, first turns, or rate limits alone. Once a fresh
+volume exists, another service error stops instead of starting recovery again.
+Use a 400,000-byte upper bound on the visible summary prompt, reducing larger
+transcripts in 200,000-byte chunks. Keep the existing four-round reduction
+limit and reject summaries that fail to reduce their input. Original volumes
+remain intact; record that hidden reasoning was unavailable and that the
+service-side cause is unknown. With this option enabled, persist completed
+rollovers before attempting the answer so a later failure does not discard
+that continuation or its usage accounting.
 
 If a context-constrained answer exhausts its output budget, retry it after
 rollover only when the fresh-volume `max_output_tokens` is strictly larger than

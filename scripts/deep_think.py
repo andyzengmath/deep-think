@@ -52,8 +52,8 @@ exact Markdown structure:
 ## References
 """
 
-VISIBLE_TRANSCRIPT_SUMMARY_PROMPT = """The opaque Responses API context was
-rejected for length. Create the continuation summary from the complete
+VISIBLE_TRANSCRIPT_SUMMARY_PROMPT = """The original full-context request could
+not be used. Create the continuation summary from the complete
 human-readable transcript below. Preserve every visible definition, hypothesis,
 result, construction, failed approach, citation, unresolved gap, and next step.
 State explicitly that hidden reasoning items were unavailable to this recovery
@@ -83,6 +83,7 @@ DEFAULT_RETRY_BASE_DELAY = 1.0
 DEFAULT_RETRY_MAX_DELAY = 30.0
 DEFAULT_REQUEST_TIMEOUT = 3600.0
 DEFAULT_POLL_INTERVAL = 2.0
+DEFAULT_POLL_TIMEOUT = 3600.0
 DEFAULT_FALLBACK_DEPLOYMENTS = (
     "gpt-5.6-sol",
     "gpt-5.6-sol-nofilters",
@@ -121,6 +122,10 @@ class OpaqueReplayError(DeepThinkError):
     pass
 
 
+class TerminalServiceError(DeepThinkError):
+    pass
+
+
 class TurnResult:
     def __init__(self, text, volume, rolled_over, transcript_path):
         self.text = text
@@ -139,10 +144,13 @@ class RetryEvent:
 
 
 class RequestOutcome:
-    def __init__(self, response, retry_count, deployment=None):
+    def __init__(
+        self, response, retry_count, deployment=None, *, intermediate_tokens=0
+    ):
         self.response = response
         self.retry_count = retry_count
         self.deployment = deployment
+        self.intermediate_tokens = intermediate_tokens
 
 
 RETRYABLE_RESPONSE_CODES = {
@@ -564,6 +572,8 @@ def _poll_background_response(
     base_delay,
     max_delay,
     poll_interval,
+    poll_timeout,
+    target_label,
     sleep,
     random_value,
     on_retry,
@@ -580,13 +590,35 @@ def _poll_background_response(
             "python -m pip install --upgrade openai azure-identity"
         ) from error
 
+    if _response_status(response) not in {"queued", "in_progress"}:
+        return response, 0
+    response_id = _response_id(response)
+    job = f"response {response_id}, {target_label}"
+    deadline = time.monotonic() + poll_timeout
+
+    def remaining():
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise DeepThinkError(
+                f"{purpose.capitalize()} poll deadline exceeded after "
+                f"{poll_timeout:g}s for {job}. The job may still be running; "
+                "retrieve this ID on its original resource before resubmitting."
+            )
+        return seconds
+
+    def wait(delay):
+        sleep(min(delay, remaining()))
+        remaining()
+
     retry_count = 0
     while _response_status(response) in {"queued", "in_progress"}:
-        response_id = _response_id(response)
-        sleep(poll_interval)
+        wait(poll_interval)
         for attempt in range(1, max_attempts + 1):
             try:
-                retrieved = client.responses.retrieve(response_id)
+                retrieved = client.responses.retrieve(
+                    response_id,
+                    timeout=min(DEFAULT_REQUEST_TIMEOUT, remaining()),
+                )
             except APIResponseValidationError as error:
                 reason = "malformed Azure response"
                 retry_error = error
@@ -600,7 +632,7 @@ def _poll_background_response(
                     reason += f" ({code})"
                 if not _status_error_is_retryable(error):
                     raise DeepThinkError(
-                        f"{purpose.capitalize()} poll failed without retry: "
+                        f"{purpose.capitalize()} poll failed without retry for {job}: "
                         f"{reason}: {message}"
                     ) from error
                 retry_error = error
@@ -620,10 +652,13 @@ def _poll_background_response(
                     retry_count += attempt - 1
                     break
 
+            remaining()
             if attempt >= max_attempts:
                 raise DeepThinkError(
                     f"{purpose.capitalize()} poll failed after "
-                    f"{attempt} attempts: {reason}"
+                    f"{attempt} attempts for {job}: {reason}: {retry_error}. "
+                    "The job may still be running; retrieve this ID on its "
+                    "original resource before resubmitting."
                 ) from retry_error
             delay = _retry_delay(
                 retry_error,
@@ -632,15 +667,16 @@ def _poll_background_response(
                 max_delay,
                 random_value,
             )
+            delay = min(delay, remaining())
             _retry_event(
                 f"{purpose} poll",
                 attempt,
                 max_attempts,
-                reason,
+                f"{reason}; {job}",
                 delay,
                 on_retry,
             )
-            sleep(delay)
+            wait(delay)
 
     return response, retry_count
 
@@ -657,8 +693,10 @@ def request_response(
     random_value=random.random,
     on_retry=None,
     poll_interval=DEFAULT_POLL_INTERVAL,
+    poll_timeout=DEFAULT_POLL_TIMEOUT,
 ):
     _validate_retry_settings(max_attempts, base_delay, max_delay)
+    _validate_poll_timeout(poll_timeout)
     if (
         not isinstance(poll_interval, (int, float))
         or not math.isfinite(poll_interval)
@@ -698,6 +736,10 @@ def request_response(
 
     for attempt in range(1, max_attempts + 1):
         active_deployment, active_client = targets[deployment_index]
+        target_label = (
+            f"deployment {active_deployment}, "
+            f"target {deployment_index + 1}/{len(targets)}"
+        )
         attempt_request = _request_for_deployment(request, active_deployment)
         try:
             response = active_client.responses.create(**attempt_request)
@@ -775,6 +817,8 @@ def request_response(
                 base_delay=base_delay,
                 max_delay=max_delay,
                 poll_interval=poll_interval,
+                poll_timeout=poll_timeout,
+                target_label=target_label,
                 sleep=sleep,
                 random_value=random_value,
                 on_retry=on_retry,
@@ -824,10 +868,18 @@ def request_response(
                     f"{response_message}"
                 )
             retryable_codes = response_codes & RETRYABLE_RESPONSE_CODES
-            if retryable_codes and attempt < max_attempts:
+            if retryable_codes:
+                request_bytes = _canonical_json_text(attempt_request).encode("utf-8")
                 reason = (
-                    "Azure response error (" + ", ".join(sorted(retryable_codes)) + ")"
+                    f"Azure response {status} "
+                    f"({', '.join(sorted(retryable_codes))}); "
+                    f"response_id={_response_id(response)}; {target_label}; "
+                    f"max_output_tokens={attempt_request.get('max_output_tokens')}; "
+                    f"request_bytes={len(request_bytes)}; "
+                    f"request_sha256={hashlib.sha256(request_bytes).hexdigest()}; "
+                    f"{response_message}"
                 )
+            if retryable_codes and attempt < max_attempts:
                 delay = _retry_delay(
                     None,
                     attempt,
@@ -838,9 +890,14 @@ def request_response(
                 retry_next(reason, delay)
                 continue
             if retryable_codes:
-                raise DeepThinkError(
+                error_type = (
+                    TerminalServiceError
+                    if status == "failed" and "server_error" in retryable_codes
+                    else DeepThinkError
+                )
+                raise error_type(
                     f"{purpose.capitalize()} request failed after "
-                    f"{attempt} attempts: {response_message}"
+                    f"{attempt} attempts: {reason}"
                 )
             if "max_output_tokens" in response_codes:
                 raise OutputLimitError(
@@ -1040,6 +1097,16 @@ def _validate_retry_settings(max_attempts, base_delay, max_delay):
 def _validate_checksum(checksum, *, label):
     if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
         raise DeepThinkError(f"State file contains an invalid {label}.")
+
+
+def _validate_poll_timeout(poll_timeout):
+    if (
+        isinstance(poll_timeout, bool)
+        or not isinstance(poll_timeout, (int, float))
+        or not math.isfinite(poll_timeout)
+        or poll_timeout <= 0
+    ):
+        raise DeepThinkError("Background poll timeout must be finite and positive.")
 
 
 def _validate_state(state, project):
@@ -1280,6 +1347,7 @@ def _rollover_markdown(
     retry_count=0,
     recovery_note=None,
     deployment=None,
+    intermediate_tokens=0,
 ):
     reasoning_mode, reasoning_effort = _reasoning_profile(deployment)
     recovery_markdown = (
@@ -1300,6 +1368,7 @@ def _rollover_markdown(
         f"- Application retries: {retry_count}\n"
         f"- Final context tokens: {usage['total_tokens']:,} / "
         f"{CONTEXT_WINDOW_TOKENS:,}\n"
+        f"- Intermediate summary tokens: {intermediate_tokens:,}\n"
     )
 
 
@@ -1417,8 +1486,11 @@ def _request_visible_transcript_summary(
     sleep,
     random_value,
     on_retry,
+    poll_timeout=DEFAULT_POLL_TIMEOUT,
+    input_limit=MAX_INPUT_TOKENS,
 ):
     total_retry_count = 0
+    intermediate_tokens = 0
     source_text = transcript
     source_label = "TRANSCRIPT"
 
@@ -1430,7 +1502,7 @@ def _request_visible_transcript_summary(
             + f"\n--- END {source_label} ---"
         )
         visible_input_upper_bound = _estimate_tokens(visible_prompt)
-        if visible_input_upper_bound <= MAX_INPUT_TOKENS:
+        if visible_input_upper_bound <= input_limit:
             break
         if reduction_round >= VISIBLE_SUMMARY_MAX_REDUCTION_ROUNDS:
             raise DeepThinkError(
@@ -1439,7 +1511,7 @@ def _request_visible_transcript_summary(
 
         chunks = _split_text_by_utf8_bytes(
             source_text,
-            VISIBLE_SUMMARY_CHUNK_BYTES,
+            min(VISIBLE_SUMMARY_CHUNK_BYTES, input_limit // 2),
         )
         summaries = []
         for index, chunk in enumerate(chunks, start=1):
@@ -1470,8 +1542,12 @@ def _request_visible_transcript_summary(
                 sleep=sleep,
                 random_value=random_value,
                 on_retry=on_retry,
+                poll_timeout=poll_timeout,
             )
             total_retry_count += chunk_outcome.retry_count
+            intermediate_tokens += _response_usage(chunk_outcome.response)[
+                "total_tokens"
+            ]
             summaries.append(
                 f"## Chunk {index} of {len(chunks)}\n\n"
                 f"{chunk_outcome.response.output_text.rstrip()}"
@@ -1513,11 +1589,13 @@ def _request_visible_transcript_summary(
         sleep=sleep,
         random_value=random_value,
         on_retry=on_retry,
+        poll_timeout=poll_timeout,
     )
     return RequestOutcome(
         final_outcome.response,
         total_retry_count + final_outcome.retry_count,
         final_outcome.deployment,
+        intermediate_tokens=intermediate_tokens,
     )
 
 
@@ -1541,6 +1619,9 @@ def _rollover_volume(
     on_retry,
     force_visible_transcript=False,
     force_visible_reason=None,
+    poll_timeout=DEFAULT_POLL_TIMEOUT,
+    recover_service_errors=False,
+    service_recovery=False,
 ):
     summary_input_upper_bound = state["context_tokens"] + _estimate_tokens(
         ROLLOVER_SUMMARY_PROMPT
@@ -1571,6 +1652,10 @@ def _rollover_volume(
             sleep=sleep,
             random_value=random_value,
             on_retry=on_retry,
+            poll_timeout=poll_timeout,
+            input_limit=(
+                VISIBLE_SUMMARY_CHUNK_BYTES if service_recovery else MAX_INPUT_TOKENS
+            ),
         )
         recovery_note = "visible transcript recovery"
     elif summary_input_upper_bound > MAX_INPUT_TOKENS:
@@ -1593,6 +1678,7 @@ def _rollover_volume(
             sleep=sleep,
             random_value=random_value,
             on_retry=on_retry,
+            poll_timeout=poll_timeout,
         )
         recovery_note = "visible transcript recovery"
     else:
@@ -1619,13 +1705,21 @@ def _rollover_volume(
                 sleep=sleep,
                 random_value=random_value,
                 on_retry=on_retry,
+                poll_timeout=poll_timeout,
             )
-        except (ContextLimitError, OpaqueReplayError):
+        except (ContextLimitError, OpaqueReplayError, TerminalServiceError) as error:
+            service_recovery = isinstance(error, TerminalServiceError)
+            if service_recovery and not recover_service_errors:
+                raise
             _retry_event(
                 "rollover summary",
                 1,
                 1,
-                "retrying from visible transcript",
+                (
+                    f"terminal server_error; retrying from visible transcript: {error}"
+                    if service_recovery
+                    else "retrying from visible transcript"
+                ),
                 0,
                 on_retry,
             )
@@ -1641,6 +1735,12 @@ def _rollover_volume(
                     sleep=sleep,
                     random_value=random_value,
                     on_retry=on_retry,
+                    poll_timeout=poll_timeout,
+                    input_limit=(
+                        VISIBLE_SUMMARY_CHUNK_BYTES
+                        if service_recovery
+                        else MAX_INPUT_TOKENS
+                    ),
                 )
             except ContextLimitError as recovery_error:
                 raise DeepThinkError(
@@ -1648,6 +1748,11 @@ def _rollover_volume(
                     "rollover summaries for context length."
                 ) from recovery_error
             recovery_note = "visible transcript recovery"
+    if service_recovery:
+        recovery_note = (
+            "visible transcript recovery after terminal server_error; "
+            "service-side cause unknown"
+        )
     summary_response = summary_outcome.response
     summary_usage = _response_usage(summary_response)
     carried_summary = summary_response.output_text.rstrip()
@@ -1662,8 +1767,11 @@ def _rollover_volume(
         summary_outcome.retry_count,
         recovery_note,
         summary_outcome.deployment,
+        summary_outcome.intermediate_tokens,
     )
-    state["cumulative_tokens"] += summary_usage["total_tokens"]
+    state["cumulative_tokens"] += (
+        summary_usage["total_tokens"] + summary_outcome.intermediate_tokens
+    )
     state["volume"] += 1
     state["turn"] = 0
     state["context_tokens"] = _estimate_carried_context_tokens(
@@ -1714,6 +1822,8 @@ def _run_turn_locked(
     sleep=time.sleep,
     random_value=random.random,
     on_retry=None,
+    poll_timeout=DEFAULT_POLL_TIMEOUT,
+    recover_service_errors=False,
 ):
     _validate_project(project)
     if not prompt.strip():
@@ -1727,6 +1837,7 @@ def _run_turn_locked(
         retry_base_delay,
         retry_max_delay,
     )
+    _validate_poll_timeout(poll_timeout)
 
     project_dir = Path(root) / project
     state_path = project_dir / "state.json"
@@ -1828,8 +1939,19 @@ def _run_turn_locked(
             sleep=sleep,
             random_value=random_value,
             on_retry=on_retry,
+            poll_timeout=poll_timeout,
+            recover_service_errors=recover_service_errors,
         )
         rolled_over = True
+        if recover_service_errors:
+            _write_pending_state(
+                state_path,
+                state,
+                context_path=context_path,
+                transcript_path=transcript_path,
+                pending_json=pending_json,
+                pending_text=pending_text,
+            )
         output_budget = _normal_output_budget(
             state["context_tokens"],
             prompt,
@@ -1863,8 +1985,19 @@ def _run_turn_locked(
             sleep=sleep,
             random_value=random_value,
             on_retry=on_retry,
+            poll_timeout=poll_timeout,
         )
-    except (ContextLimitError, OutputLimitError, OpaqueReplayError) as error:
+    except (
+        ContextLimitError,
+        OutputLimitError,
+        OpaqueReplayError,
+        TerminalServiceError,
+    ) as error:
+        service_recovery = isinstance(error, TerminalServiceError)
+        if service_recovery and (
+            not recover_service_errors or not history or rolled_over
+        ):
+            raise
         exhausted_output_budget = output_budget
         if isinstance(error, OutputLimitError) and output_budget >= MAX_OUTPUT_TOKENS:
             raise DeepThinkError(
@@ -1882,12 +2015,16 @@ def _run_turn_locked(
                 "smaller source batches."
             ) from error
         recovery_reason = (
-            "opaque replay failure; retrying from visible transcript"
-            if isinstance(error, OpaqueReplayError)
+            f"terminal server_error; retrying from visible transcript: {error}"
+            if service_recovery
             else (
-                "output limit; forcing rollover"
-                if isinstance(error, OutputLimitError)
-                else "context limit; forcing rollover"
+                "opaque replay failure; retrying from visible transcript"
+                if isinstance(error, OpaqueReplayError)
+                else (
+                    "output limit; forcing rollover"
+                    if isinstance(error, OutputLimitError)
+                    else "context limit; forcing rollover"
+                )
             )
         )
         _retry_event(
@@ -1921,16 +2058,34 @@ def _run_turn_locked(
             sleep=sleep,
             random_value=random_value,
             on_retry=on_retry,
-            force_visible_transcript=isinstance(error, OpaqueReplayError),
+            poll_timeout=poll_timeout,
+            recover_service_errors=recover_service_errors and not rolled_over,
+            service_recovery=service_recovery,
+            force_visible_transcript=(
+                service_recovery or isinstance(error, OpaqueReplayError)
+            ),
             force_visible_reason=(
-                "invalid_encrypted_content; retrying from visible transcript"
-                if isinstance(error, OpaqueReplayError)
-                else None
+                recovery_reason
+                if service_recovery
+                else (
+                    "invalid_encrypted_content; retrying from visible transcript"
+                    if isinstance(error, OpaqueReplayError)
+                    else None
+                )
             ),
         )
         rolled_over = True
         reactive_recovery_used = True
         recovery_count = 1
+        if recover_service_errors:
+            _write_pending_state(
+                state_path,
+                state,
+                context_path=context_path,
+                transcript_path=transcript_path,
+                pending_json=pending_json,
+                pending_text=pending_text,
+            )
         output_budget = _normal_output_budget(
             state["context_tokens"],
             prompt,
@@ -1979,6 +2134,7 @@ def _run_turn_locked(
             sleep=sleep,
             random_value=random_value,
             on_retry=on_retry,
+            poll_timeout=poll_timeout,
         )
     response = outcome.response
     _require_complete(response)
@@ -2034,6 +2190,8 @@ def run_turn(
     sleep=time.sleep,
     random_value=random.random,
     on_retry=None,
+    poll_timeout=DEFAULT_POLL_TIMEOUT,
+    recover_service_errors=False,
 ):
     _validate_project(project)
     with _project_lock(root, project):
@@ -2051,6 +2209,8 @@ def run_turn(
             sleep=sleep,
             random_value=random_value,
             on_retry=on_retry,
+            poll_timeout=poll_timeout,
+            recover_service_errors=recover_service_errors,
         )
 
 
@@ -2115,6 +2275,17 @@ def _build_parser():
         "--max-attempts",
         type=int,
         default=DEFAULT_MAX_ATTEMPTS,
+    )
+    ask.add_argument(
+        "--poll-timeout",
+        type=float,
+        default=DEFAULT_POLL_TIMEOUT,
+        help="Polling budget in seconds per accepted job (default: 3600); never resubmit on expiry.",
+    )
+    ask.add_argument(
+        "--recover-service-errors",
+        action="store_true",
+        help="Allow one visible-transcript rollover after terminal server_error retries exhaust.",
     )
     ask.add_argument(
         "--retry-base-delay",
@@ -2207,6 +2378,8 @@ def main(
             retry_base_delay=args.retry_base_delay,
             retry_max_delay=args.retry_max_delay,
             on_retry=report_retry,
+            poll_timeout=args.poll_timeout,
+            recover_service_errors=args.recover_service_errors,
         )
     except DeepThinkError as error:
         stderr.write(f"deep-think: {error}\n")

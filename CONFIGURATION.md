@@ -129,6 +129,55 @@ python "scripts\deep_think.py" ask `
 Prefer the environment variable for routine use so the endpoint is not copied
 into shell scripts or command history.
 
+## Polling and service-error recovery
+
+Each accepted background job has a **3,600-second polling budget**, configurable
+with `--poll-timeout`. Successful `queued`/`in_progress` retrievals do not reset
+the deadline. Poll intervals, retry delays, and SDK retrieval timeouts are
+capped to the remaining budget. The deadline is checked between operations;
+in-flight credential or transport phases can finish after it. This is a
+per-job budget, not a deadline for the entire turn or all its summary requests.
+
+On expiry or exhausted retrieval retries, the runner stops and reports the
+response ID, deployment, and target ordinal. It does not cancel the remote job,
+switch resources, or submit a replacement. The job may still be running:
+retrieve that ID on its original resource before starting another attempt.
+
+For an existing project whose accepted jobs repeatedly finish with
+`status="failed"` and `error.code="server_error"`, explicitly enable recovery:
+
+```powershell
+python "scripts\deep_think.py" ask `
+  --project "project-slug" `
+  --prompt "Continue the investigation." `
+  --poll-timeout 7200 `
+  --recover-service-errors
+```
+
+The normal ordered failover policy runs first. After the submission-attempt
+budget ends with a terminal response-object `server_error`, this option permits
+one visible-transcript rollover and one answer attempt in the fresh volume
+(with its normal bounded failover). It also covers a failed ordinary rollover
+summary. Recovery uses a 400,000-byte visible-input ceiling, splitting larger
+sources into 200,000-byte chunks before synthesis; no source text is truncated.
+Summary reduction remains bounded to four rounds.
+
+Recovery is off by default because summaries cannot retain hidden reasoning or
+guarantee every detail of exact replay. Original volumes remain on disk.
+With this option enabled, completed rollovers are checkpointed before the
+answer attempt, including their usage and any primary-model upgrade, even if
+the answer later fails. No further service-error recovery is started after a
+fresh volume has been produced. First turns, submission-level HTTP failures,
+rate limits alone, refusals, and polling failures do not trigger this recovery.
+
+Retryable terminal response diagnostics include the response ID, deployment,
+target ordinal, output budget, canonical request byte count and SHA-256, and
+the service's error message (including any support correlation ID).
+Capture stderr when investigating failures; full prompts, encrypted context,
+and credentials are not included in these added request diagnostics.
+A `server_error` is not proof of context exhaustion. This recovery is a
+mitigation, not a diagnosis or guarantee that Azure will accept the next request.
+
 ## Validate configuration
 
 Confirm that the required setting exists without printing its value:

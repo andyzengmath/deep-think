@@ -66,6 +66,12 @@ allow the entire chain to be tried on retryable errors. Every new logical
 request starts on the primary, including rollover summaries. Accepted
 background jobs stay on their original resource while polling.
 
+Polling has a one-hour per-job budget (`--poll-timeout`); expiry stops without
+resubmitting a potentially running job. For repeated terminal `server_error`
+failures, `--recover-service-errors` opts into one smaller, chunked
+visible-transcript recovery. Original volumes are retained; this mitigates
+failures without claiming their service-side cause is known.
+
 Existing GPT-5.6/GPT-5.4 projects automatically adopt GPT-6 on their next
 successful default turn without discarding history. Explicit `--deployment`
 overrides remain supported. Remove an old `AZURE_OPENAI_DEPLOYMENT` override

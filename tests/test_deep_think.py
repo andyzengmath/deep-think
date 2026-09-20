@@ -80,6 +80,7 @@ class FakeResponses:
         self.retrieved = list(retrieved or [])
         self.calls = []
         self.retrieve_calls = []
+        self.retrieve_timeouts = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
@@ -88,8 +89,9 @@ class FakeResponses:
             raise result
         return result
 
-    def retrieve(self, response_id):
+    def retrieve(self, response_id, *, timeout=None):
         self.retrieve_calls.append(response_id)
+        self.retrieve_timeouts.append(timeout)
         result = self.retrieved.pop(0)
         if isinstance(result, BaseException):
             raise result

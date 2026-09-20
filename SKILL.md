@@ -102,6 +102,24 @@ Poll the returned response ID while its status is `queued` or `in_progress`.
 Retry transient retrieval failures without resubmitting the original job; this
 prevents duplicate maximum-effort requests and avoids long synchronous HTTP
 timeouts. Never switch deployments while polling an already-created response.
+Use `--poll-timeout` to set the per-job polling budget (default 3,600 seconds).
+Expiry is terminal locally, not a cancellation: record the response ID and
+target, and reconcile that job on its original resource before resubmitting.
+SDK retrieval timeouts and waits use the remaining budget; in-flight credential
+or transport phases can finish after the deadline.
+
+After bounded failover ends with a terminal response-object `server_error`,
+`--recover-service-errors` explicitly allows one visible-transcript recovery
+for an existing volume. Do not enable it silently: summaries lose hidden
+reasoning and are not exact replay. Use smaller 200,000-byte chunks when the
+visible input exceeds 400,000 bytes, retaining the complete original volume.
+Completed rollovers are checkpointed before attempting the answer when this
+option is enabled. Never use service-error recovery for polling failures,
+authentication errors, rate limits alone, submission-level HTTP errors, or
+first turns; do not repeat it after a fresh volume has been produced.
+Preserve terminal diagnostics, including response ID, target, request hash,
+byte count, output budget, and service/support message. The internal Azure
+failure remains undiagnosed; do not label it proven context exhaustion.
 
 Allow one reactive recovery. If Azure rejects a committed context or a
 context-constrained answer exhausts its output budget, summarize the last
