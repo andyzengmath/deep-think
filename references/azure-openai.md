@@ -4,15 +4,21 @@ Use this reference when maintaining or debugging the runner.
 
 ## Runtime configuration and fixed request settings
 
-- Endpoint: required from `AZURE_OPENAI_ENDPOINT` or `--endpoint`; no resource
-  URL is committed.
+- Endpoints: primary `AZURE_OPENAI_GPT6_ENDPOINT`, backup
+  `AZURE_OPENAI_GPT6_BACKUP_ENDPOINT`, and legacy `AZURE_OPENAI_ENDPOINT`
+  (overridable by `AZURE_OPENAI_FALLBACK_ENDPOINT`). CLI overrides are
+  `--endpoint`, `--backup-endpoint`, and `--fallback-endpoint`; no resource URL
+  is committed. See CONFIGURATION.md for single-resource compatibility.
 - Primary deployment: `AZURE_OPENAI_DEPLOYMENT`, defaulting to
-  `gpt-5.6-sol`.
-- 429 fallbacks: `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro`.
+  `gpt-6-astra`.
+- Backup deployment: `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` or
+  `--backup-deployment`, defaulting to the primary deployment name.
+- Error/rate-limit fallbacks: GPT-6 backup resource, `gpt-5.6-sol`,
+  `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro` on the legacy resource.
 - API: Responses
 - Authentication: `DefaultAzureCredential` and
   `get_bearer_token_provider(..., "https://ai.azure.com/.default")`
-- GPT-5.6 reasoning: `{"mode": "pro", "effort": "max",
+- GPT-6 and GPT-5.6 reasoning: `{"mode": "pro", "effort": "max",
   "context": "all_turns", "summary": "auto"}`
 - GPT-5.4 Pro fallback reasoning: `{"effort": "xhigh",
   "summary": "auto"}`; mode and all-turns context are not configurable there.
@@ -28,13 +34,15 @@ Pass the bearer token provider callable to `OpenAI(api_key=...)`. Do not read,
 accept, or persist API keys.
 
 The endpoint must use HTTPS and include a host. The runner rejects endpoints
-containing user information, query parameters, or fragments so credentials
-cannot be smuggled through the URL. The fixed Entra scope above is a public
-protocol identifier, not a credential.
+containing user information, arbitrary query parameters, or fragments. The
+only query exception is a single date-formatted `api-version` on a full
+`/openai/responses` URL. Normalize it to `/openai/` and pass the version as
+the SDK's `default_query`, preserving it on both create and retrieve.
+The fixed Entra scope above is a public protocol identifier, not a credential.
 
 ## Retry policy
 
-Make at most three total attempts by default. Retry:
+Make at most five total submission attempts by default. Retry:
 
 - Connection and timeout exceptions.
 - Malformed SDK responses, including malformed HTTP 200 payloads detected by
@@ -42,16 +50,19 @@ Make at most three total attempts by default. Retry:
   loop.
 - Empty completed responses.
 - HTTP 408, 409, 429, and 5xx responses.
+- Submission-level HTTP 404 with exact code `DeploymentNotFound`.
 - Azure `server_error`, `too_many_requests`, `rate_limit_exceeded`,
   `no_capacity`, `timeout`, and `temporarily_unavailable` response codes.
 
-On a submission-level 429, advance through `gpt-5.6-sol`,
-`gpt-5.6-sol-nofilters`, and `gpt-5.4-pro`; cycle to the primary only if the
-configured attempt count leaves another attempt. A new logical request always
-starts on its primary deployment. Apply failover only before a response is
-accepted or after a terminal rate-limit response. A transient 429 while polling
-an existing background response retries retrieval of the same response ID and
-never creates a duplicate job.
+On every retryable submission failure, advance through the primary GPT-6
+resource, backup GPT-6 resource, `gpt-5.6-sol`, `gpt-5.6-sol-nofilters`, and
+`gpt-5.4-pro`; cycle to the primary only if the attempt budget permits.
+A new logical request always starts on its primary, including rollover and
+visible-transcript summaries. Apply failover before acceptance or after a
+terminal transient/malformed/empty response. Transient failures while polling
+retry retrieval of the same response ID on the same client/resource, never a
+new job. Exhausted polling retries stop explicitly rather than resubmitting.
+Retry diagnostics identify the next deployment and target ordinal.
 
 Submit long-running responses in background mode.  After the initial request
 returns an ID, retry transient polling failures against that ID rather than
@@ -64,13 +75,22 @@ Honor `x-should-retry`, `Retry-After`, and `retry-after-ms`, except that HTTP
 failover and same-ID polling recovery cannot be disabled. Otherwise use
 exponential backoff with bounded jitter. Never retry refusals, authentication
 or authorization failures, ordinary bad requests, or other permanent 4xx
-errors. Persist only the final complete response.
+errors, even when `x-should-retry` is `true`. The exact submission-level
+`DeploymentNotFound` exception is target-specific and allows failover.
+Persist only the final complete response.
 
 ## Context policy
 
 GPT-5.6 Sol has a 1,050,000-token context window, a 922,000-token maximum input,
 and a 128,000-token maximum output. Reasoning tokens consume the same context
 window and count as output tokens.
+
+The GPT-6 upgrade retains these local budgets rather than assuming a larger
+context window. GPT-6-specific limits are not independently established here;
+service-side context errors still follow the bounded recovery policy.
+Existing projects on built-in older deployments can adopt the new default:
+verify state and file checksums first, retain all history, record the primary
+upgrade, and persist it only through the ordinary successful-turn commit.
 
 Persist every Responses output item locally, including encrypted reasoning
 items, and replay them with the next user message. Use 900,000 tokens as the

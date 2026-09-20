@@ -139,6 +139,48 @@ def make_validation_error():
 
 
 class RequestConfigurationTests(unittest.TestCase):
+    def test_default_model_and_attempt_budget_cover_gpt6_chain(self):
+        deep_think = load_module()
+        with mock.patch.dict("os.environ", {}, clear=True):
+            args = deep_think._build_parser().parse_args(
+                ["ask", "--project", "upgrade", "--prompt", "Continue."]
+            )
+        self.assertEqual(args.deployment, "gpt-6-astra")
+        self.assertEqual(args.max_attempts, 5)
+
+    def test_preview_responses_url_preserves_api_version_for_create_and_poll(self):
+        import httpx
+        import openai
+
+        deep_think = load_module()
+        requests = []
+
+        def handle(request):
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={"id": "resp-preview", "status": "completed", "output": []},
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handle)) as http_client:
+            client = deep_think.create_client(
+                "https://example.invalid/openai/responses"
+                "?api-version=2025-04-01-preview",
+                credential_factory=object,
+                token_provider_factory=lambda *_args: lambda: "test-token",
+                openai_factory=lambda **kwargs: openai.OpenAI(
+                    **kwargs, http_client=http_client
+                ),
+            )
+            client.responses.create(model="gpt-6-astra", input="Hello.")
+            client.responses.retrieve("resp-preview")
+        self.assertEqual(
+            [request.url.path for request in requests],
+            ["/openai/responses", "/openai/responses/resp-preview"],
+        )
+        for request in requests:
+            self.assertEqual(request.url.params["api-version"], "2025-04-01-preview")
+
     def test_parser_has_no_endpoint_when_environment_is_unconfigured(self):
         deep_think = load_module()
 
@@ -221,6 +263,26 @@ class RequestConfigurationTests(unittest.TestCase):
                 openai_factory=lambda **_kwargs: object(),
             )
 
+    def test_preview_url_rejects_extra_duplicate_or_invalid_query_parameters(self):
+        deep_think = load_module()
+        for query in [
+            "api-version=2025-04-01-preview&token=secret",
+            "api-version=2025-04-01-preview&api-version=2025-04-01-preview",
+            "api-version=not-a-version",
+        ]:
+            with (
+                self.subTest(query=query),
+                self.assertRaisesRegex(
+                    deep_think.DeepThinkError, "must not contain credentials"
+                ),
+            ):
+                deep_think.create_client(
+                    "https://example.invalid/openai/responses?" + query,
+                    credential_factory=object,
+                    token_provider_factory=lambda *_args: object(),
+                    openai_factory=lambda **_kwargs: object(),
+                )
+
     def test_client_rejects_fragment_in_endpoint(self):
         deep_think = load_module()
 
@@ -281,6 +343,195 @@ class RequestConfigurationTests(unittest.TestCase):
         self.assertIs(captured["openai"]["api_key"], provider)
         self.assertEqual(captured["openai"]["max_retries"], 0)
         self.assertEqual(captured["openai"]["timeout"], 3600)
+
+
+class CrossEndpointFailoverTests(unittest.TestCase):
+    def test_backup_deployment_can_differ_from_primary_model_name(self):
+        deep_think = load_module()
+        primary = FakeClient([make_status_error(429, "rate_limit_exceeded")])
+        backup = FakeClient([FakeResponse("resp-backup", "Complete.")])
+        clients = {"primary": primary, "backup": backup}
+        router = deep_think.create_routed_client(
+            "primary",
+            "gpt-6-astra",
+            backup_endpoint="backup",
+            backup_deployment="gpt-6-astra-backup",
+            client_factory=clients.__getitem__,
+        )
+        outcome = deep_think.request_response(
+            router,
+            deep_think.build_response_request([], "gpt-6-astra"),
+            purpose="answer",
+            sleep=lambda _: None,
+        )
+        self.assertEqual(outcome.deployment, "gpt-6-astra-backup")
+        self.assertEqual(backup.responses.calls[0]["reasoning"]["mode"], "pro")
+        self.assertEqual(backup.responses.calls[0]["reasoning"]["effort"], "max")
+
+    def make_router(self, deep_think, results, retrieved=None):
+        primary = FakeClient(results[:1])
+        backup = FakeClient(results[1:2], retrieved)
+        legacy = FakeClient(results[2:])
+        clients = {"primary": primary, "backup": backup, "legacy": legacy}
+        router = deep_think.create_routed_client(
+            "primary",
+            "gpt-6-astra",
+            backup_endpoint="backup",
+            fallback_endpoint="legacy",
+            client_factory=clients.__getitem__,
+        )
+        return router, primary, backup, legacy
+
+    def test_all_five_targets_are_tried_in_priority_order_with_correct_profiles(self):
+        deep_think = load_module()
+        router, primary, backup, legacy = self.make_router(
+            deep_think,
+            [
+                make_status_error(429, "rate_limit_exceeded"),
+                make_status_error(500, "server_error"),
+                make_status_error(503, "server_error"),
+                make_status_error(429, "no_capacity"),
+                FakeResponse("resp-fallback", "Complete."),
+            ],
+        )
+        request = deep_think.build_response_request([], "gpt-6-astra")
+        outcome = deep_think.request_response(
+            router, request, purpose="answer", sleep=lambda _: None
+        )
+        calls = (
+            primary.responses.calls + backup.responses.calls + legacy.responses.calls
+        )
+        self.assertEqual(
+            [call["model"] for call in calls],
+            [
+                "gpt-6-astra",
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-sol-nofilters",
+                "gpt-5.4-pro",
+            ],
+        )
+        for call in calls[:4]:
+            self.assertEqual(call["reasoning"], request["reasoning"])
+        self.assertEqual(calls[4]["reasoning"], {"effort": "xhigh", "summary": "auto"})
+        self.assertEqual(outcome.deployment, "gpt-5.4-pro")
+        self.assertEqual(outcome.retry_count, 4)
+
+    def test_transient_submission_errors_advance_to_backup(self):
+        import httpx
+        import openai
+
+        deep_think = load_module()
+        malformed = FakeResponse("resp-malformed", "Bad.")
+        malformed.usage = None
+        failures = [
+            make_status_error(408, "timeout"),
+            make_status_error(409, "conflict"),
+            make_status_error(500, "server_error"),
+            make_status_error(404, "DeploymentNotFound"),
+            openai.APIConnectionError(request=httpx.Request("POST", "https://test")),
+            openai.APITimeoutError(request=httpx.Request("POST", "https://test")),
+            make_validation_error(),
+            malformed,
+            FakeResponse("resp-empty", ""),
+            FakeResponse(
+                "resp-failed",
+                "",
+                status="failed",
+                error=SimpleNamespace(code="server_error", message="Unavailable."),
+            ),
+        ]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                router, primary, backup, _ = self.make_router(
+                    deep_think, [failure, FakeResponse("resp-ok", "Complete.")]
+                )
+                deep_think.request_response(
+                    router,
+                    deep_think.build_response_request([], "gpt-6-astra"),
+                    purpose="answer",
+                    sleep=lambda _: None,
+                )
+                self.assertEqual(len(primary.responses.calls), 1)
+                self.assertEqual(len(backup.responses.calls), 1)
+
+    def test_backup_poll_stays_on_original_endpoint_and_next_request_resets(self):
+        deep_think = load_module()
+        router, primary, backup, legacy = self.make_router(
+            deep_think,
+            [
+                make_status_error(429, "rate_limit_exceeded"),
+                FakeResponse("resp-job", "", status="queued"),
+            ],
+            [
+                make_status_error(500, "server_error"),
+                FakeResponse("resp-job", "Complete."),
+            ],
+        )
+        request = deep_think.build_response_request([], "gpt-6-astra")
+        deep_think.request_response(
+            router, request, purpose="answer", sleep=lambda _: None
+        )
+        primary.responses.queued.append(FakeResponse("resp-new", "New answer."))
+        deep_think.request_response(
+            router, request, purpose="rollover", sleep=lambda _: None
+        )
+        self.assertEqual(backup.responses.retrieve_calls, ["resp-job", "resp-job"])
+        self.assertEqual(primary.responses.retrieve_calls, [])
+        self.assertEqual(len(primary.responses.calls), 2)
+        self.assertEqual(len(backup.responses.calls), 1)
+        self.assertEqual(legacy.responses.calls, [])
+
+    def test_poll_exhaustion_does_not_submit_another_job(self):
+        deep_think = load_module()
+        router, primary, backup, legacy = self.make_router(
+            deep_think,
+            [
+                make_status_error(429, "rate_limit_exceeded"),
+                FakeResponse("resp-job", "", status="queued"),
+            ],
+            [make_status_error(500, "server_error") for _ in range(2)],
+        )
+        with self.assertRaisesRegex(deep_think.DeepThinkError, "poll failed"):
+            deep_think.request_response(
+                router,
+                deep_think.build_response_request([], "gpt-6-astra"),
+                purpose="answer",
+                max_attempts=2,
+                sleep=lambda _: None,
+            )
+        self.assertEqual(len(primary.responses.calls), 1)
+        self.assertEqual(len(backup.responses.calls), 1)
+        self.assertEqual(legacy.responses.calls, [])
+
+    def test_permanent_errors_do_not_fail_over(self):
+        deep_think = load_module()
+        for status, code in [
+            (400, "invalid_request"),
+            (401, "unauthorized"),
+            (403, "forbidden"),
+            (404, "not_found"),
+        ]:
+            with self.subTest(status=status):
+                router, primary, backup, legacy = self.make_router(
+                    deep_think,
+                    [
+                        make_status_error(
+                            status, code, headers={"x-should-retry": "true"}
+                        )
+                    ],
+                )
+                with self.assertRaisesRegex(
+                    deep_think.DeepThinkError, "failed without retry"
+                ):
+                    deep_think.request_response(
+                        router,
+                        deep_think.build_response_request([], "gpt-6-astra"),
+                        purpose="answer",
+                        sleep=lambda _: None,
+                    )
+                self.assertEqual(len(primary.responses.calls), 1)
+                self.assertEqual(backup.responses.calls + legacy.responses.calls, [])
 
 
 class RetryTests(unittest.TestCase):
@@ -409,7 +660,7 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(outcome.retry_count, 1)
         self.assertEqual(len(client.responses.calls), 2)
         self.assertEqual(sleeps, [0])
-        self.assertEqual(events[0].reason, "empty response")
+        self.assertIn("empty response; switching deployment", events[0].reason)
 
     def test_transient_azure_error_retries_using_retry_after(self):
         deep_think = load_module()
@@ -620,7 +871,9 @@ class RetryTests(unittest.TestCase):
         self.assertIs(outcome.response, complete)
         self.assertEqual(outcome.retry_count, 1)
         self.assertEqual(len(client.responses.calls), 2)
-        self.assertEqual(events[0].reason, "malformed Azure response")
+        self.assertIn(
+            "malformed Azure response; switching deployment", events[0].reason
+        )
 
     def test_nested_malformed_completed_response_is_retried(self):
         deep_think = load_module()
@@ -652,7 +905,9 @@ class RetryTests(unittest.TestCase):
         self.assertIs(outcome.response, complete)
         self.assertEqual(outcome.retry_count, 1)
         self.assertEqual(len(client.responses.calls), 2)
-        self.assertEqual(events[0].reason, "malformed Azure response")
+        self.assertIn(
+            "malformed Azure response; switching deployment", events[0].reason
+        )
 
     def test_empty_response_exhaustion_reports_attempt_count(self):
         deep_think = load_module()
@@ -2178,6 +2433,120 @@ class PersistenceTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
+    def test_explicit_legacy_deployment_uses_legacy_resource(self):
+        deep_think = load_module()
+        client = FakeClient([FakeResponse("resp-old", "Complete.")])
+        factory = mock.Mock(return_value=client)
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "AZURE_OPENAI_GPT6_ENDPOINT": "primary",
+                    "AZURE_OPENAI_GPT6_BACKUP_ENDPOINT": "backup",
+                    "AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT": "gpt-6-astra-backup",
+                    "AZURE_OPENAI_ENDPOINT": "legacy",
+                },
+                clear=True,
+            ),
+            tempfile.TemporaryDirectory() as root,
+        ):
+            exit_code = deep_think.main(
+                [
+                    "ask",
+                    "--project",
+                    "legacy",
+                    "--prompt",
+                    "Continue.",
+                    "--deployment",
+                    "gpt-5.6-sol",
+                    "--root",
+                    root,
+                ],
+                client_factory=factory,
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            )
+        self.assertEqual(exit_code, 0)
+        factory.assert_called_once_with("legacy")
+
+    def test_cli_routes_new_model_endpoints_and_retains_legacy_resource(self):
+        deep_think = load_module()
+        clients = {
+            "primary": FakeClient([make_status_error(429, "no_capacity")]),
+            "backup": FakeClient([make_status_error(500, "server_error")]),
+            "legacy": FakeClient([FakeResponse("resp-legacy", "Recovered.")]),
+        }
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "AZURE_OPENAI_GPT6_ENDPOINT": "primary",
+                    "AZURE_OPENAI_GPT6_BACKUP_ENDPOINT": "backup",
+                    "AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT": "gpt-6-astra-backup",
+                    "AZURE_OPENAI_ENDPOINT": "legacy",
+                },
+                clear=True,
+            ),
+            tempfile.TemporaryDirectory() as root,
+        ):
+            exit_code = deep_think.main(
+                [
+                    "ask",
+                    "--project",
+                    "cli-routing",
+                    "--prompt",
+                    "Continue.",
+                    "--root",
+                    root,
+                    "--retry-base-delay",
+                    "0",
+                ],
+                client_factory=clients.__getitem__,
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(clients["primary"].responses.calls[0]["model"], "gpt-6-astra")
+        self.assertEqual(
+            clients["backup"].responses.calls[0]["model"], "gpt-6-astra-backup"
+        )
+        self.assertEqual(clients["legacy"].responses.calls[0]["model"], "gpt-5.6-sol")
+
+    def test_existing_5_6_project_upgrades_without_losing_history(self):
+        deep_think = load_module()
+        client = FakeClient(
+            [
+                FakeResponse("resp-old", "Old result."),
+                FakeResponse("resp-new", "New result."),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as root:
+            deep_think.run_turn(
+                client,
+                root=root,
+                project="upgrade",
+                prompt="Old question.",
+                deployment="gpt-5.6-sol",
+            )
+            deep_think.run_turn(
+                client,
+                root=root,
+                project="upgrade",
+                prompt="Continue.",
+                deployment="gpt-6-astra",
+            )
+            state = json.loads((Path(root) / "upgrade" / "state.json").read_text())
+            transcript = (Path(root) / "upgrade" / "0001-transcript.md").read_text(
+                encoding="utf-8"
+            )
+        self.assertEqual(state["deployment"], "gpt-6-astra")
+        self.assertEqual(state["turn"], 2)
+        self.assertEqual(
+            client.responses.calls[1]["input"][0]["content"], "Old question."
+        )
+        self.assertIn("Old result.", transcript)
+        self.assertIn("gpt-6-astra", transcript)
+
     def test_cli_reconfigures_cp1252_stdout_to_utf8(self):
         deep_think = load_module()
         client = FakeClient([FakeResponse("resp-cli", "Proof complete. ∎")])
@@ -2285,9 +2654,10 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(stdout.getvalue(), "Recovered result.\n")
         self.assertIn(
-            "Retrying answer after empty response (attempt 1/2",
+            "Retrying answer after empty response; switching deployment",
             stderr.getvalue(),
         )
+        self.assertIn("(attempt 1/2", stderr.getvalue())
 
     def test_cli_reports_atomic_write_failures_without_tracebacks(self):
         deep_think = load_module()

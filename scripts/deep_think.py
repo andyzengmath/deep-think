@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 DEEP_MATH_INSTRUCTIONS = """You are a deep mathematical research partner.
 Work on open problems, difficult proofs, and complex theoretical constructions.
@@ -78,19 +78,20 @@ MAX_INPUT_TOKENS = 922_000
 MAX_OUTPUT_TOKENS = 128_000
 MIN_RESPONSE_TOKENS = 25_000
 DEFAULT_ROLLOVER_TOKENS = 900_000
-DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_RETRY_BASE_DELAY = 1.0
 DEFAULT_RETRY_MAX_DELAY = 30.0
 DEFAULT_REQUEST_TIMEOUT = 3600.0
 DEFAULT_POLL_INTERVAL = 2.0
-DEFAULT_RATE_LIMIT_FALLBACK_DEPLOYMENTS = (
+DEFAULT_FALLBACK_DEPLOYMENTS = (
+    "gpt-5.6-sol",
     "gpt-5.6-sol-nofilters",
     "gpt-5.4-pro",
 )
 VISIBLE_SUMMARY_CHUNK_BYTES = 400_000
 VISIBLE_CHUNK_OUTPUT_TOKENS = MAX_OUTPUT_TOKENS
 VISIBLE_SUMMARY_MAX_REDUCTION_ROUNDS = 4
-DEFAULT_DEPLOYMENT = "gpt-5.6-sol"
+DEFAULT_DEPLOYMENT = "gpt-6-astra"
 ENTRA_SCOPE = "https://ai.azure.com/.default"
 STATE_SCHEMA = "deep-think-state"
 LEGACY_STATE_VERSION = 1
@@ -347,6 +348,12 @@ def _status_error_is_retryable(error):
     status_code, _, _ = _status_error_details(error)
     if status_code == 429:
         return True
+    if (
+        status_code is not None
+        and 400 <= status_code < 500
+        and status_code not in {408, 409}
+    ):
+        return False
     response = getattr(error, "response", None)
     headers = getattr(response, "headers", {})
     directive = headers.get("x-should-retry")
@@ -422,10 +429,12 @@ def _retry_event(purpose, attempt, max_attempts, reason, delay, on_retry):
         on_retry(event)
 
 
-def _rate_limit_deployment_chain(primary_deployment):
-    return tuple(
-        dict.fromkeys((primary_deployment, *DEFAULT_RATE_LIMIT_FALLBACK_DEPLOYMENTS))
-    )
+def _deployment_chain(primary_deployment):
+    if primary_deployment in DEFAULT_FALLBACK_DEPLOYMENTS:
+        return DEFAULT_FALLBACK_DEPLOYMENTS[
+            DEFAULT_FALLBACK_DEPLOYMENTS.index(primary_deployment) :
+        ]
+    return (primary_deployment, *DEFAULT_FALLBACK_DEPLOYMENTS)
 
 
 def _request_for_deployment(request, deployment):
@@ -459,16 +468,29 @@ def create_client(
     parsed_endpoint = urlsplit(endpoint)
     if parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc:
         raise DeepThinkError("Azure OpenAI endpoint must use HTTPS and include a host.")
+    query = parse_qsl(parsed_endpoint.query, keep_blank_values=True)
+    preview_endpoint = (
+        parsed_endpoint.path.rstrip("/") == "/openai/responses"
+        and len(query) == 1
+        and query[0][0] == "api-version"
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:-preview)?", query[0][1])
+    )
     if (
         parsed_endpoint.username is not None
         or parsed_endpoint.password is not None
-        or parsed_endpoint.query
+        or (parsed_endpoint.query and not preview_endpoint)
         or parsed_endpoint.fragment
     ):
         raise DeepThinkError(
             "Azure OpenAI endpoint must not contain credentials, query parameters, "
-            "or fragments."
+            "or fragments, except api-version on a preview Responses URL."
         )
+    client_options = {}
+    if preview_endpoint:
+        endpoint = urlunsplit(
+            (parsed_endpoint.scheme, parsed_endpoint.netloc, "/openai/", "", "")
+        )
+        client_options["default_query"] = {"api-version": query[0][1]}
 
     if (
         credential_factory is None
@@ -500,7 +522,37 @@ def create_client(
         api_key=token_provider,
         max_retries=0,
         timeout=DEFAULT_REQUEST_TIMEOUT,
+        **client_options,
     )
+
+
+class DeploymentRouter:
+    def __init__(self, targets):
+        self.targets = targets
+
+
+def create_routed_client(
+    endpoint,
+    deployment,
+    *,
+    backup_endpoint=None,
+    backup_deployment=None,
+    fallback_endpoint=None,
+    client_factory=create_client,
+):
+    clients = {}
+
+    def client_for(resource):
+        if resource not in clients:
+            clients[resource] = client_factory(resource)
+        return clients[resource]
+
+    targets = [(deployment, client_for(endpoint))]
+    if backup_endpoint:
+        targets.append((backup_deployment or deployment, client_for(backup_endpoint)))
+    for fallback in _deployment_chain(deployment)[1:]:
+        targets.append((fallback, client_for(fallback_endpoint or endpoint)))
+    return DeploymentRouter(targets)
 
 
 def _poll_background_response(
@@ -598,7 +650,7 @@ def request_response(
     request,
     *,
     purpose,
-    max_attempts=3,
+    max_attempts=DEFAULT_MAX_ATTEMPTS,
     base_delay=1.0,
     max_delay=30.0,
     sleep=time.sleep,
@@ -626,14 +678,29 @@ def request_response(
         ) from error
 
     request_has_encrypted_content = _request_contains_encrypted_content(request)
-    deployment_chain = _rate_limit_deployment_chain(request["model"])
+    targets = (
+        client.targets
+        if isinstance(client, DeploymentRouter)
+        else [(name, client) for name in _deployment_chain(request["model"])]
+    )
     deployment_index = 0
     poll_retry_count = 0
+
+    def retry_next(reason, delay):
+        nonlocal deployment_index
+        deployment_index = (deployment_index + 1) % len(targets)
+        reason += (
+            f"; switching deployment to {targets[deployment_index][0]}"
+            f" (target {deployment_index + 1}/{len(targets)})"
+        )
+        _retry_event(purpose, attempt, max_attempts, reason, delay, on_retry)
+        sleep(delay)
+
     for attempt in range(1, max_attempts + 1):
-        active_deployment = deployment_chain[deployment_index]
+        active_deployment, active_client = targets[deployment_index]
         attempt_request = _request_for_deployment(request, active_deployment)
         try:
-            response = client.responses.create(**attempt_request)
+            response = active_client.responses.create(**attempt_request)
         except APIResponseValidationError as error:
             if attempt >= max_attempts:
                 raise DeepThinkError(
@@ -647,15 +714,7 @@ def request_response(
                 max_delay,
                 random_value,
             )
-            _retry_event(
-                purpose,
-                attempt,
-                max_attempts,
-                "malformed Azure response",
-                delay,
-                on_retry,
-            )
-            sleep(delay)
+            retry_next("malformed Azure response", delay)
             continue
         except APIConnectionError as error:
             if attempt >= max_attempts:
@@ -670,15 +729,7 @@ def request_response(
                 max_delay,
                 random_value,
             )
-            _retry_event(
-                purpose,
-                attempt,
-                max_attempts,
-                type(error).__name__,
-                delay,
-                on_retry,
-            )
-            sleep(delay)
+            retry_next(type(error).__name__, delay)
             continue
         except APIStatusError as error:
             status_code, code, message = _status_error_details(error)
@@ -695,7 +746,8 @@ def request_response(
                     f"{purpose.capitalize()} request exceeded the context "
                     f"limit: {reason}: {message}"
                 ) from error
-            if not _status_error_is_retryable(error):
+            deployment_missing = status_code == 404 and code == "DeploymentNotFound"
+            if not (_status_error_is_retryable(error) or deployment_missing):
                 raise DeepThinkError(
                     f"{purpose.capitalize()} request failed without retry: "
                     f"{reason}: {message}"
@@ -705,11 +757,6 @@ def request_response(
                     f"{purpose.capitalize()} request failed after "
                     f"{attempt} attempts: {reason}: {message}"
                 ) from error
-            if status_code == 429:
-                deployment_index = (deployment_index + 1) % len(deployment_chain)
-                reason += (
-                    f"; switching deployment to {deployment_chain[deployment_index]}"
-                )
             delay = _retry_delay(
                 error,
                 attempt,
@@ -717,19 +764,11 @@ def request_response(
                 max_delay,
                 random_value,
             )
-            _retry_event(
-                purpose,
-                attempt,
-                max_attempts,
-                reason,
-                delay,
-                on_retry,
-            )
-            sleep(delay)
+            retry_next(reason, delay)
             continue
         try:
             response, retries = _poll_background_response(
-                client,
+                active_client,
                 response,
                 purpose=purpose,
                 max_attempts=max_attempts,
@@ -766,15 +805,7 @@ def request_response(
                     max_delay,
                     random_value,
                 )
-                _retry_event(
-                    purpose,
-                    attempt,
-                    max_attempts,
-                    "empty response",
-                    delay,
-                    on_retry,
-                )
-                sleep(delay)
+                retry_next("empty response", delay)
                 continue
             if status == "completed":
                 raise DeepThinkError(
@@ -797,16 +828,6 @@ def request_response(
                 reason = (
                     "Azure response error (" + ", ".join(sorted(retryable_codes)) + ")"
                 )
-                if retryable_codes & {
-                    "too_many_requests",
-                    "rate_limit_exceeded",
-                    "no_capacity",
-                }:
-                    deployment_index = (deployment_index + 1) % len(deployment_chain)
-                    reason += (
-                        f"; switching deployment to "
-                        f"{deployment_chain[deployment_index]}"
-                    )
                 delay = _retry_delay(
                     None,
                     attempt,
@@ -814,15 +835,7 @@ def request_response(
                     max_delay,
                     random_value,
                 )
-                _retry_event(
-                    purpose,
-                    attempt,
-                    max_attempts,
-                    reason,
-                    delay,
-                    on_retry,
-                )
-                sleep(delay)
+                retry_next(reason, delay)
                 continue
             if retryable_codes:
                 raise DeepThinkError(
@@ -854,15 +867,7 @@ def request_response(
                 max_delay,
                 random_value,
             )
-            _retry_event(
-                purpose,
-                attempt,
-                max_attempts,
-                "malformed Azure response",
-                delay,
-                on_retry,
-            )
-            sleep(delay)
+            retry_next("malformed Azure response", delay)
             continue
 
     raise DeepThinkError(f"{purpose.capitalize()} request exhausted retries.")
@@ -1733,7 +1738,11 @@ def _run_turn_locked(
             raise DeepThinkError(
                 f"Project title is already {state['title']!r}; omit --title."
             )
-        if deployment != state["deployment"]:
+        upgrading = (
+            deployment == DEFAULT_DEPLOYMENT
+            and state["deployment"] in DEFAULT_FALLBACK_DEPLOYMENTS
+        )
+        if deployment != state["deployment"] and not upgrading:
             raise DeepThinkError(
                 f"Project deployment is already {state['deployment']!r}."
             )
@@ -1773,6 +1782,12 @@ def _run_turn_locked(
             state.get("transcript_sha256"),
             "transcript",
         )
+        if deployment != state["deployment"]:
+            transcript += (
+                f"\nPrimary deployment upgraded from `{state['deployment']}` "
+                f"to `{deployment}`; preceding context retained.\n"
+            )
+            state["deployment"] = deployment
     pending_json = {}
     pending_text = {}
     rolled_over = False
@@ -2042,7 +2057,7 @@ def run_turn(
 def _build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Run a persistent GPT-5.6 Sol deep-mathematics conversation "
+            "Run a persistent GPT-6 Astra deep-mathematics conversation "
             "through Azure OpenAI."
         )
     )
@@ -2068,11 +2083,24 @@ def _build_parser():
     )
     ask.add_argument(
         "--endpoint",
-        default=os.getenv("AZURE_OPENAI_ENDPOINT"),
         help=(
-            "Azure OpenAI v1 endpoint. Prefer the AZURE_OPENAI_ENDPOINT "
-            "environment variable."
+            "Primary v1 endpoint or preview Responses URL. Defaults to "
+            "AZURE_OPENAI_GPT6_ENDPOINT, then AZURE_OPENAI_ENDPOINT."
         ),
+    )
+    ask.add_argument(
+        "--backup-endpoint",
+        help="Backup resource for the primary model; defaults to AZURE_OPENAI_GPT6_BACKUP_ENDPOINT for GPT-6.",
+    )
+    ask.add_argument(
+        "--backup-deployment",
+        help="Backup deployment name if different from the primary deployment.",
+    )
+    ask.add_argument(
+        "--fallback-endpoint",
+        default=os.getenv("AZURE_OPENAI_FALLBACK_ENDPOINT")
+        or os.getenv("AZURE_OPENAI_ENDPOINT"),
+        help="Resource hosting the existing GPT-5.6 and GPT-5.4 deployments.",
     )
     ask.add_argument(
         "--deployment",
@@ -2131,7 +2159,34 @@ def main(
 
     try:
         prompt = _prompt_from_args(args, stdin)
-        client = client_factory(args.endpoint)
+        legacy_deployment = args.deployment in DEFAULT_FALLBACK_DEPLOYMENTS
+        endpoint = (
+            args.endpoint
+            or (
+                args.fallback_endpoint
+                if legacy_deployment
+                else os.getenv("AZURE_OPENAI_GPT6_ENDPOINT")
+            )
+            or os.getenv("AZURE_OPENAI_ENDPOINT")
+        )
+        backup_endpoint = args.backup_endpoint or (
+            None
+            if legacy_deployment
+            else os.getenv("AZURE_OPENAI_GPT6_BACKUP_ENDPOINT")
+        )
+        client = create_routed_client(
+            endpoint,
+            args.deployment,
+            backup_endpoint=backup_endpoint,
+            backup_deployment=args.backup_deployment
+            or (
+                None
+                if legacy_deployment
+                else os.getenv("AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT")
+            ),
+            fallback_endpoint=args.fallback_endpoint,
+            client_factory=client_factory,
+        )
 
         def report_retry(event):
             stderr.write(
