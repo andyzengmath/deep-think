@@ -1,11 +1,11 @@
 ---
 name: deep-think
-description: "Run persistent, maximum-depth mathematical research through Azure OpenAI GPT-5.6 Sol with Microsoft Entra ID, Responses API pro mode, max reasoning effort, structured Markdown, local full-context replay, and automatic long-context rollover summaries. Use for open problems, difficult proofs, counterexample searches, novel constructions, deep theory development, or any long multi-turn math investigation that needs a roughly one-million-token context and version-controlled continuity."
+description: "Run persistent, maximum-depth mathematical research through Azure OpenAI GPT-6 Astra with GPT-5.6 Sol and GPT-5.4 Pro backups, Microsoft Entra ID, Responses API pro mode, max reasoning effort, structured Markdown, local full-context replay, and automatic long-context rollover summaries. Use for open problems, difficult proofs, counterexample searches, novel constructions, deep theory development, or any long multi-turn math investigation needing version-controlled continuity."
 ---
 
 # Deep Think
 
-Delegate a hard mathematical investigation to GPT-5.6 Sol while preserving both
+Delegate a hard mathematical investigation to GPT-6 Astra while preserving both
 a human-readable transcript and the exact local API context needed for later
 turns.
 
@@ -26,9 +26,17 @@ turns.
    shell. The endpoint has no committed default:
 
    ```powershell
-   $env:AZURE_OPENAI_ENDPOINT = Read-Host "Azure OpenAI v1 endpoint"
-   $env:AZURE_OPENAI_DEPLOYMENT = Read-Host "Azure OpenAI deployment name"
+   $env:AZURE_OPENAI_GPT6_ENDPOINT = Read-Host "GPT-6 primary Responses URL (East US)"
+   $env:AZURE_OPENAI_GPT6_BACKUP_ENDPOINT = Read-Host "GPT-6 backup Responses URL (South Central US)"
+   $env:AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT = "gpt-6-astra-nofilters"
+   $env:AZURE_OPENAI_ENDPOINT = Read-Host "Existing GPT-5.6/GPT-5.4 v1 endpoint"
    ```
+
+   Both GPT-6 names default to `gpt-6-astra`; use
+   `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` for a differently named backup.
+   Accept v1 base URLs or full preview Responses URLs with only an
+   `api-version` query parameter.
+   Remove stale `AZURE_OPENAI_DEPLOYMENT` overrides to use the new default.
 
 Read [references/azure-openai.md](references/azure-openai.md) only when changing
 the endpoint, authentication, model settings, or context policy.
@@ -65,7 +73,7 @@ Use the defaults unless the environment requires a different bounded policy:
 python ".github\skills\deep-think\scripts\deep_think.py" ask `
   --project "project-slug" `
   --prompt "Continue the proof audit." `
-  --max-attempts 3 `
+  --max-attempts 5 `
   --retry-base-delay 1 `
   --retry-max-delay 30
 ```
@@ -78,10 +86,13 @@ or other permanent 4xx failures. Validate every response field that later code
 uses before leaving the application retry loop so malformed HTTP 200 payloads
 cannot escape as late `TypeError` or `AttributeError` crashes.
 
-For a submission-level 429, route bounded attempts in this order:
-`gpt-5.6-sol`, `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro`. If attempts remain,
-cycle back to the primary deployment. Every new logical request starts on the
-primary. Preserve `pro` mode and `max` effort on both 5.6 deployments. For the
+For retryable submission failures or terminal transient response errors, route
+bounded attempts in this order: `gpt-6-astra` primary resource,
+`gpt-6-astra` backup resource, `gpt-5.6-sol`, `gpt-5.6-sol-nofilters`,
+then `gpt-5.4-pro`. Also advance on a submission-level `DeploymentNotFound`
+404; other permanent 4xx errors remain terminal. If attempts remain, cycle
+back to the primary. Every new logical request starts on the primary.
+Preserve `pro` mode and `max` effort on both GPT-6 and both GPT-5.6 targets. For the
 5.4 fallback only, omit unsupported reasoning mode/context settings and use
 `xhigh`, its maximum supported effort. Record the deployment and effective
 reasoning profile in the transcript.
@@ -91,6 +102,24 @@ Poll the returned response ID while its status is `queued` or `in_progress`.
 Retry transient retrieval failures without resubmitting the original job; this
 prevents duplicate maximum-effort requests and avoids long synchronous HTTP
 timeouts. Never switch deployments while polling an already-created response.
+Use `--poll-timeout` to set the per-job polling budget (default 3,600 seconds).
+Expiry is terminal locally, not a cancellation: record the response ID and
+target, and reconcile that job on its original resource before resubmitting.
+SDK retrieval timeouts and waits use the remaining budget; in-flight credential
+or transport phases can finish after the deadline.
+
+After bounded failover ends with a terminal response-object `server_error`,
+`--recover-service-errors` explicitly allows one visible-transcript recovery
+for an existing volume. Do not enable it silently: summaries lose hidden
+reasoning and are not exact replay. Use smaller 200,000-byte chunks when the
+visible input exceeds 400,000 bytes, retaining the complete original volume.
+Completed rollovers are checkpointed before attempting the answer when this
+option is enabled. Never use service-error recovery for polling failures,
+authentication errors, rate limits alone, submission-level HTTP errors, or
+first turns; do not repeat it after a fresh volume has been produced.
+Preserve terminal diagnostics, including response ID, target, request hash,
+byte count, output budget, and service/support message. The internal Azure
+failure remains undiagnosed; do not label it proven context exhaustion.
 
 Allow one reactive recovery. If Azure rejects a committed context or a
 context-constrained answer exhausts its output budget, summarize the last
@@ -131,6 +160,10 @@ Commit these files when repository policy permits. The Markdown files are the
 agent-readable research record; context files retain encrypted reasoning items
 for exact stateless continuation and can be large.
 
+Existing GPT-5.6/GPT-5.4 projects adopt GPT-6 on their next successful default
+turn. Preserve history and checksums; let the runner record the upgrade.
+Use an explicit `--deployment` to keep an older primary when required.
+
 Run only one writer per project. The runner creates `.deep-think.lock` while a
 turn is active and verifies a deterministic `state.json` digest plus the
 current context/transcript checksums before every continuation. Current state
@@ -143,8 +176,9 @@ caps each response to stay below it, and rolls over before fewer than 25,000
 tokens remain for reasoning and output. It asks the current conversation for a
 structured continuation summary, closes that Markdown volume, starts the next
 volume, and seeds a fresh API context with the summary. This reserve is required
-because the 1,050,000-token model window also has a 922,000-token input limit and
-must contain reasoning and output tokens.
+because the retained shared budget reserves space for reasoning and output.
+Do not infer GPT-6 deployment limits from the GPT-5.6 budget; service-side
+context rejections still use the bounded recovery policy.
 
 After bounded recovery is exhausted, stop on any authentication, API,
 incomplete-response, state-integrity, or file error. Resolve the error

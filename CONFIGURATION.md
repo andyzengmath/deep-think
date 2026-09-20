@@ -8,8 +8,9 @@ supplied at runtime; none belong in this repository.
 
 You need:
 
-1. An Azure OpenAI resource with a Responses API deployment.
-2. The resource's v1 endpoint and deployment name.
+1. Two Azure OpenAI resources deploying `gpt-6-astra`, plus the existing
+   GPT-5.6/GPT-5.4 resource.
+2. Each resource's v1 base endpoint or full preview Responses URL.
 3. An Entra identity allowed to invoke that deployment. Assign the narrowest
    suitable data-plane role, normally **Cognitive Services OpenAI User**, at
    the resource or deployment scope.
@@ -22,23 +23,49 @@ process environment:
 
 ```powershell
 az login
-$env:AZURE_OPENAI_ENDPOINT = Read-Host "Azure OpenAI v1 endpoint"
-$env:AZURE_OPENAI_DEPLOYMENT = Read-Host "Azure OpenAI deployment name"
+$env:AZURE_OPENAI_GPT6_ENDPOINT = Read-Host "GPT-6 primary Responses URL (East US)"
+$env:AZURE_OPENAI_GPT6_BACKUP_ENDPOINT = Read-Host "GPT-6 backup Responses URL (South Central US)"
+$env:AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT = "gpt-6-astra-nofilters"
+$env:AZURE_OPENAI_ENDPOINT = Read-Host "Existing GPT-5.6/GPT-5.4 v1 endpoint"
 ```
 
-Copy the v1 endpoint from the Azure portal or your organization's deployment
-output. Do not add a token, user information, query string, or fragment. The
-runner requires HTTPS and normalizes the trailing slash.
+Copy endpoints from the Azure portal or deployment output. The runner accepts
+HTTPS v1 base URLs and full `/openai/responses?api-version=2025-04-01-preview`
+URLs. For the latter it preserves `api-version` for both creation and polling,
+without appending a second `responses` path. No other query parameters,
+credentials, or fragments are accepted.
 
-The deployment variable is optional when its name is `gpt-5.6-sol`; setting it
-explicitly makes the active deployment unambiguous.
+The primary deployment defaults to `gpt-6-astra`; an explicit `--deployment`
+or `AZURE_OPENAI_DEPLOYMENT` overrides it. Remove an old deployment override
+or set it to `gpt-6-astra` to activate the new default.
 
-The built-in 429 fallback chain assumes the same resource also has deployments
-named `gpt-5.6-sol-nofilters` and `gpt-5.4-pro`. Missing fallback deployments do
-not affect normal primary requests, but a 429 failover will stop explicitly if
-Azure reports that a configured fallback does not exist. The 5.4 fallback uses
-`xhigh` reasoning without a reasoning mode because that deployment does not
-support the 5.6 `pro`/`max` profile.
+The ordered chain is:
+
+1. `gpt-6-astra` on `AZURE_OPENAI_GPT6_ENDPOINT` (East US).
+2. `gpt-6-astra` on `AZURE_OPENAI_GPT6_BACKUP_ENDPOINT` (South Central US).
+3. `gpt-5.6-sol` on the existing resource.
+4. `gpt-5.6-sol-nofilters` on the existing resource.
+5. `gpt-5.4-pro` on the existing resource.
+
+Both GPT-6 deployment names default to `gpt-6-astra`. If the backup resource
+uses a different deployment name, set `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT`
+or pass `--backup-deployment`; the GPT-6 `pro`/`max` profile is unchanged.
+
+Set `AZURE_OPENAI_FALLBACK_ENDPOINT` to override the existing resource
+(`AZURE_OPENAI_ENDPOINT`). If neither is set, older models use the primary
+resource. If no dedicated GPT-6 endpoint is set, `AZURE_OPENAI_ENDPOINT` also
+serves as the primary. Omitting the backup endpoint selects single-resource
+primary operation; configure both GPT-6 endpoints for the full five-target chain.
+Explicit legacy `--deployment` selections use the legacy resource and start
+at that model in the chain, without promoting back to GPT-6.
+
+Five total submission attempts are allowed by default. Retryable service,
+connection, timeout, malformed/empty response errors, and submission-level
+`DeploymentNotFound` 404s advance to the next target. Authentication,
+authorization, refusals, and ordinary invalid requests remain terminal.
+GPT-6 and GPT-5.6 use `pro`/`max`; GPT-5.4 Pro uses `xhigh` without
+unsupported reasoning mode/context options. Polling an accepted job never
+changes resources or resubmits the job, even if polling retries are exhausted.
 
 The values above last only for the current PowerShell process. If you automate
 them, use an operating-system, CI, or cloud configuration store outside the
@@ -49,11 +76,22 @@ environment variables added later. Restart that terminal or agent after
 persisting `AZURE_OPENAI_ENDPOINT`, or set it explicitly in the current
 PowerShell session.
 
+To persist the new endpoint settings for future Windows processes:
+
+```powershell
+[Environment]::SetEnvironmentVariable("AZURE_OPENAI_GPT6_ENDPOINT", $env:AZURE_OPENAI_GPT6_ENDPOINT, "User")
+[Environment]::SetEnvironmentVariable("AZURE_OPENAI_GPT6_BACKUP_ENDPOINT", $env:AZURE_OPENAI_GPT6_BACKUP_ENDPOINT, "User")
+[Environment]::SetEnvironmentVariable("AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT", $env:AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT, "User")
+```
+
+Keep the existing fallback endpoint configured as well. Restart terminals and
+agents after changing user-level settings; existing processes do not reload them.
+
 ## Managed identity
 
 In Azure, enable a system-assigned or user-assigned managed identity and grant
-it the required data-plane role. Configure `AZURE_OPENAI_ENDPOINT` and
-`AZURE_OPENAI_DEPLOYMENT` in the service environment. `DefaultAzureCredential`
+it the required data-plane role on every resource. Configure the endpoint
+variables above in the service environment. `DefaultAzureCredential`
 will select the managed identity automatically.
 
 For a user-assigned managed identity, supply `AZURE_CLIENT_ID` through the
@@ -78,7 +116,8 @@ artifacts, but ignore rules are not a substitute for secret scanning.
 
 ## Command-line override
 
-`--endpoint` can override the environment variable for an isolated run:
+`--endpoint`, `--backup-endpoint`, and `--fallback-endpoint` override the
+corresponding resources for an isolated run:
 
 ```powershell
 python "scripts\deep_think.py" ask `
@@ -90,13 +129,62 @@ python "scripts\deep_think.py" ask `
 Prefer the environment variable for routine use so the endpoint is not copied
 into shell scripts or command history.
 
+## Polling and service-error recovery
+
+Each accepted background job has a **3,600-second polling budget**, configurable
+with `--poll-timeout`. Successful `queued`/`in_progress` retrievals do not reset
+the deadline. Poll intervals, retry delays, and SDK retrieval timeouts are
+capped to the remaining budget. The deadline is checked between operations;
+in-flight credential or transport phases can finish after it. This is a
+per-job budget, not a deadline for the entire turn or all its summary requests.
+
+On expiry or exhausted retrieval retries, the runner stops and reports the
+response ID, deployment, and target ordinal. It does not cancel the remote job,
+switch resources, or submit a replacement. The job may still be running:
+retrieve that ID on its original resource before starting another attempt.
+
+For an existing project whose accepted jobs repeatedly finish with
+`status="failed"` and `error.code="server_error"`, explicitly enable recovery:
+
+```powershell
+python "scripts\deep_think.py" ask `
+  --project "project-slug" `
+  --prompt "Continue the investigation." `
+  --poll-timeout 7200 `
+  --recover-service-errors
+```
+
+The normal ordered failover policy runs first. After the submission-attempt
+budget ends with a terminal response-object `server_error`, this option permits
+one visible-transcript rollover and one answer attempt in the fresh volume
+(with its normal bounded failover). It also covers a failed ordinary rollover
+summary. Recovery uses a 400,000-byte visible-input ceiling, splitting larger
+sources into 200,000-byte chunks before synthesis; no source text is truncated.
+Summary reduction remains bounded to four rounds.
+
+Recovery is off by default because summaries cannot retain hidden reasoning or
+guarantee every detail of exact replay. Original volumes remain on disk.
+With this option enabled, completed rollovers are checkpointed before the
+answer attempt, including their usage and any primary-model upgrade, even if
+the answer later fails. No further service-error recovery is started after a
+fresh volume has been produced. First turns, submission-level HTTP failures,
+rate limits alone, refusals, and polling failures do not trigger this recovery.
+
+Retryable terminal response diagnostics include the response ID, deployment,
+target ordinal, output budget, canonical request byte count and SHA-256, and
+the service's error message (including any support correlation ID).
+Capture stderr when investigating failures; full prompts, encrypted context,
+and credentials are not included in these added request diagnostics.
+A `server_error` is not proof of context exhaustion. This recovery is a
+mitigation, not a diagnosis or guarantee that Azure will accept the next request.
+
 ## Validate configuration
 
 Confirm that the required setting exists without printing its value:
 
 ```powershell
-if (-not $env:AZURE_OPENAI_ENDPOINT) {
-  throw "AZURE_OPENAI_ENDPOINT is not configured."
+if (-not $env:AZURE_OPENAI_GPT6_ENDPOINT -or -not $env:AZURE_OPENAI_GPT6_BACKUP_ENDPOINT) {
+  throw "Both GPT-6 endpoints must be configured for regional failover."
 }
 az account show --output none
 python "scripts\deep_think.py" --help
@@ -107,15 +195,19 @@ When installed as a repository skill, prefix paths with
 
 ## Troubleshooting
 
-- **Missing endpoint:** set `AZURE_OPENAI_ENDPOINT` or pass `--endpoint`.
+- **Missing endpoint:** set `AZURE_OPENAI_GPT6_ENDPOINT` or pass `--endpoint`.
 - **Endpoint exists at user scope but the runner says it is missing:** restart
   the terminal or agent process so it inherits the updated environment.
 - **HTTP 401:** refresh `az login` or check the managed/workload identity.
 - **HTTP 403:** verify the identity's data-plane role and resource scope.
 - **Deployment not found:** set `AZURE_OPENAI_DEPLOYMENT` to the deployment
-  name, not the base model name unless they are identical.
-- **HTTP 429:** the runner tries `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro`,
-  and starts the next logical request back on the primary deployment.
+  name, not the base model name unless they are identical. For the GPT-6
+  backup, use `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` or `--backup-deployment`.
+  An available model listing does not prove a deployment with that name exists.
+- **HTTP 429 or transient errors:** the runner advances through the ordered
+  chain above and starts the next logical request on the primary deployment.
+- **Old model still selected:** clear an old `AZURE_OPENAI_DEPLOYMENT`
+  override or set it to `gpt-6-astra`, then restart the terminal/agent.
 - **Credential chain selects the wrong account:** inspect `az account show`,
   choose the intended subscription, and log in again. Do not work around the
   issue by adding an API key.
