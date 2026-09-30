@@ -39,6 +39,10 @@ For theorem proving, open-problem research, counterexample searches, difficult
 mathematical constructions, or theory building, read and follow
 `.github\skills\deep-think\SKILL.md` before doing substantive mathematical
 reasoning.
+
+For sustained research, follow the skill's `references\graph-search-workflow.md`.
+Load the project's `research-graph.json` before continuing; update it after
+each bounded research episode and before a handoff.
 ```
 
 ## Configure and authenticate
@@ -101,6 +105,24 @@ python ".github\skills\deep-think\scripts\deep_think.py" ask `
 
 Research records are written to `deep-think-transcripts\<project>\`. Review
 their contents before committing them.
+
+## Persistent proof-strategy workflow
+
+For sustained projects, use a scope-aware AND/OR proof graph with best-first
+action selection and bounded DFS episodes. Keep the progress graph at
+`deep-think-transcripts\<project>\research-graph.json`, separate from the
+runner's protected `state.json` and context files.
+
+- `references\graph-search-workflow.md` defines startup, action selection,
+  proof promotion, stopping, and handoff rules.
+- `references\research-graph.schema.json` defines the version-1 JSON format.
+- `references\research-graph.template.json` is a minimal new-project record;
+  replace its example mission and slug before using it.
+
+The graph is maintained by the research agent, not automatically by the API
+runner. It records mathematical claims, artifact gaps, evidence provenance,
+and proposed actions without treating finite calculations as a solved root
+problem. No extra database or scheduler is required.
 
 ## Validate
 

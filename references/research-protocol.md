@@ -1,5 +1,20 @@
 # Mathematical research protocol
 
+## Resume from the proof graph
+
+For sustained investigations, follow `graph-search-workflow.md` before
+choosing another research action. Maintain one versioned
+`research-graph.json` per stable project, using `research-graph.schema.json`.
+The JSON records scopes, AND/OR obligations, evidence references, action
+contracts, unresolved bridges, and the current frontier; Markdown remains
+the home of checkable proofs and derivations.
+
+Read the graph at session start. Update it after each bounded episode and
+before stopping or handing off, including inconclusive outcomes and
+uncertain in-flight jobs. Never infer root resolution from completed tasks,
+finite-order compatibility, or a successful API response. The graph is
+agent-maintained; it is not the runner's protected `state.json`.
+
 ## Frame the first turn
 
 Include:

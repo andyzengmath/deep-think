@@ -11,8 +11,21 @@ turns.
 
 ## Prepare
 
+Resolve bundled scripts and references relative to this loaded skill's base
+directory, not the working repository. The examples below show a project
+installation; for a personal Copilot CLI installation, use
+`$HOME\.copilot\skills\deep-think\scripts\deep_think.py` instead. Keep the
+working directory and transcript root in the research project, not the skill
+directory. Use the current shell's Azure configuration and Entra authentication;
+Copilot's GitHub login does not authenticate Azure requests.
+
 1. Read [references/research-protocol.md](references/research-protocol.md) before
-   framing a new investigation.
+   starting or resuming an investigation.
+   For sustained research, also follow
+   `references\graph-search-workflow.md`: locate and read the project's
+   `research-graph.json` before selecting another mathematical action.
+   Initialize a new graph only for a genuinely new project, not because the
+   current working directory changed.
 2. Install the current SDKs if the runner reports missing dependencies:
 
    ```powershell
@@ -144,6 +157,20 @@ otherwise persist the successful rollover and split or narrow the request.
 5. Preserve the generated files. Do not hand-edit `state.json` or
    `*-context.json`.
 
+For sustained research, maintain
+`deep-think-transcripts\<project>\research-graph.json` using
+`references\research-graph.schema.json`. This is the agent-maintained search
+record, separate from the runner's protected API state. Load it on resumption
+and update it after each bounded episode and before every handoff.
+
+Use scope-aware AND/OR obligations, best-first action selection, and bounded
+DFS episodes. Track mathematical status separately from artifact readiness
+and running jobs. Repeated finite-order repairs require an abstraction
+checkpoint; completed tasks never imply that the root problem is solved.
+See `references\graph-search-workflow.md` for the selection, evidence, JSON
+update, and recovery contract. The runner does not update this graph
+automatically, and this workflow does not authorize additional spending.
+
 ## Preserve and roll over context
 
 Find all records under:
@@ -151,6 +178,7 @@ Find all records under:
 ```text
 deep-think-transcripts/<project>/
 |-- state.json
+|-- research-graph.json
 |-- 0001-transcript.md
 |-- 0001-context.json
 `-- ...

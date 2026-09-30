@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Deep Think research graph, version 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "revision", "updated_at", "project", "mission", "policy", "nodes", "inferences", "actions", "evidence", "events", "checkpoint"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"enum": ["template", "research-project"]},
+    "revision": {"type": "integer", "minimum": 1},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slug", "title", "workspace_root", "evidence_root"],
+      "properties": {
+        "slug": {"$ref": "#/$defs/id"},
+        "title": {"$ref": "#/$defs/text"},
+        "workspace_root": {"$ref": "#/$defs/text"},
+        "evidence_root": {"$ref": "#/$defs/text"}
+      }
+    },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statement", "status", "solution_node_ids", "resolution_node_id"],
+      "properties": {
+        "statement": {"$ref": "#/$defs/text"},
+        "status": {"enum": ["open", "candidate", "resolved"]},
+        "solution_node_ids": {"$ref": "#/$defs/ids", "minItems": 1},
+        "resolution_node_id": {"anyOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]}
+      },
+      "allOf": [{
+        "if": {"properties": {"status": {"const": "resolved"}}},
+        "then": {"properties": {"resolution_node_id": {"$ref": "#/$defs/id"}}},
+        "else": {"properties": {"resolution_node_id": {"type": "null"}}}
+      }]
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "selection", "episode_reasoning_turns", "active_strategy_limit", "plateau_episodes", "repeated_repairs", "allocation_percent"],
+      "properties": {
+        "mode": {"const": "agent-maintained"},
+        "selection": {"const": "best-first-with-bounded-dfs"},
+        "episode_reasoning_turns": {"type": "integer", "minimum": 1},
+        "active_strategy_limit": {"type": "integer", "minimum": 1},
+        "plateau_episodes": {"type": "integer", "minimum": 1},
+        "repeated_repairs": {"type": "integer", "minimum": 1},
+        "allocation_percent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["developed", "bridge_or_alternative", "audit_consolidation"],
+          "properties": {
+            "developed": {"type": "integer", "minimum": 0, "maximum": 100},
+            "bridge_or_alternative": {"type": "integer", "minimum": 0, "maximum": 100},
+            "audit_consolidation": {"type": "integer", "minimum": 0, "maximum": 100}
+          }
+        }
+      }
+    },
+    "nodes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/node"}},
+    "inferences": {"type": "array", "items": {"$ref": "#/$defs/inference"}},
+    "actions": {"type": "array", "items": {"$ref": "#/$defs/action"}},
+    "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}},
+    "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["research_status", "reason", "frontier_action_ids", "frontier_order", "next_steps", "jobs", "last_recorded_research_turn"],
+      "properties": {
+        "research_status": {"enum": ["paused", "ready", "running", "waiting", "blocked", "finished"]},
+        "reason": {"$ref": "#/$defs/text"},
+        "frontier_action_ids": {"$ref": "#/$defs/ids"},
+        "frontier_order": {"enum": ["unranked", "ranked"]},
+        "next_steps": {"$ref": "#/$defs/texts"},
+        "jobs": {"type": "array", "items": {"$ref": "#/$defs/job"}},
+        "last_recorded_research_turn": {"type": ["integer", "null"], "minimum": 0}
+      }
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+    "text": {"type": "string", "minLength": 1},
+    "ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "texts": {"type": "array", "items": {"$ref": "#/$defs/text"}},
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hypotheses", "fixed", "free", "quantities"],
+      "properties": {
+        "hypotheses": {"$ref": "#/$defs/texts"},
+        "fixed": {"$ref": "#/$defs/texts"},
+        "free": {"$ref": "#/$defs/texts"},
+        "quantities": {"$ref": "#/$defs/texts"}
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "statement", "status", "scope", "assumption_ids", "evidence_refs", "acceptance_basis", "non_claims"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["goal", "claim", "artifact"]},
+        "statement": {"$ref": "#/$defs/text"},
+        "status": {"type": "string"},
+        "scope": {"$ref": "#/$defs/scope"},
+        "assumption_ids": {"$ref": "#/$defs/ids"},
+        "evidence_refs": {"$ref": "#/$defs/ids"},
+        "acceptance_basis": {"type": ["string", "null"]},
+        "non_claims": {"$ref": "#/$defs/texts"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "artifact"}}},
+          "then": {"properties": {"status": {"enum": ["missing", "ready", "stale"]}}},
+          "else": {"properties": {"status": {"enum": ["open", "candidate", "conditional", "accepted", "disputed", "refuted"]}}}
+        },
+        {
+          "if": {"properties": {"status": {"enum": ["accepted", "refuted", "ready"]}}},
+          "then": {"properties": {"evidence_refs": {"minItems": 1}, "acceptance_basis": {"$ref": "#/$defs/text"}}}
+        }
+      ]
+    },
+    "inference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "premise_ids", "conclusion_id", "status", "binding", "argument", "evidence_refs"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "premise_ids": {"$ref": "#/$defs/ids", "minItems": 1},
+        "conclusion_id": {"$ref": "#/$defs/id"},
+        "status": {"enum": ["proposed", "accepted", "rejected"]},
+        "binding": {"$ref": "#/$defs/text"},
+        "argument": {"$ref": "#/$defs/text"},
+        "evidence_refs": {"$ref": "#/$defs/ids"}
+      },
+      "allOf": [{
+        "if": {"properties": {"status": {"enum": ["accepted", "rejected"]}}},
+        "then": {"properties": {"evidence_refs": {"minItems": 1}}}
+      }]
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "lane", "strategy", "operator", "status", "target_ids", "requires_node_ids", "input_refs", "question", "expected_output", "success_effect", "failure_effect", "stop_condition", "score", "budget"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "lane": {"enum": ["developed", "bridge_or_alternative", "audit_consolidation"]},
+        "strategy": {"$ref": "#/$defs/text"},
+        "operator": {"enum": ["prove", "counterexample", "audit", "repair", "compute", "materialize", "generalize", "bridge", "synthesize"]},
+        "status": {"enum": ["proposed", "ready", "running", "blocked", "paused", "completed", "failed", "cancelled"]},
+        "target_ids": {"$ref": "#/$defs/ids", "minItems": 1},
+        "requires_node_ids": {"$ref": "#/$defs/ids"},
+        "input_refs": {"$ref": "#/$defs/ids"},
+        "question": {"$ref": "#/$defs/text"},
+        "expected_output": {"$ref": "#/$defs/text"},
+        "success_effect": {"$ref": "#/$defs/text"},
+        "failure_effect": {"$ref": "#/$defs/text"},
+        "stop_condition": {"$ref": "#/$defs/text"},
+        "score": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["R", "D", "U", "G", "C", "rationale"],
+              "properties": {
+                "R": {"type": "integer", "minimum": 0, "maximum": 3},
+                "D": {"type": "integer", "minimum": 0, "maximum": 3},
+                "U": {"type": "integer", "minimum": 0, "maximum": 3},
+                "G": {"type": "integer", "minimum": 0, "maximum": 3},
+                "C": {"type": "number", "exclusiveMinimum": 0},
+                "rationale": {"$ref": "#/$defs/text"}
+              }
+            }
+          ]
+        },
+        "budget": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["reasoning_turns", "wall_minutes", "authorization"],
+              "properties": {
+                "reasoning_turns": {"type": "integer", "minimum": 1},
+                "wall_minutes": {"type": "number", "exclusiveMinimum": 0},
+                "authorization": {"$ref": "#/$defs/text"}
+              }
+            }
+          ]
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "path", "sha256", "provenance"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["proof", "calculation", "source", "audit", "design"]},
+        "path": {"$ref": "#/$defs/text"},
+        "sha256": {"type": ["string", "null"], "pattern": "^[a-fA-F0-9]{64}$"},
+        "provenance": {"$ref": "#/$defs/text"}
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "at", "revision", "kind", "summary", "node_ids", "action_ids"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "at": {"type": "string", "format": "date-time"},
+        "revision": {"type": "integer", "minimum": 1},
+        "kind": {"$ref": "#/$defs/text"},
+        "summary": {"$ref": "#/$defs/text"},
+        "node_ids": {"$ref": "#/$defs/ids"},
+        "action_ids": {"$ref": "#/$defs/ids"},
+        "evidence_refs": {"$ref": "#/$defs/ids"},
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reasoning_turns", "native_runs", "wall_minutes"],
+          "properties": {
+            "reasoning_turns": {"type": ["integer", "null"], "minimum": 0},
+            "native_runs": {"type": ["integer", "null"], "minimum": 0},
+            "wall_minutes": {"type": ["number", "null"], "minimum": 0}
+          }
+        }
+      },
+      "allOf": [{
+        "if": {"properties": {"kind": {"const": "episode"}}},
+        "then": {"required": ["evidence_refs", "usage"]}
+      }]
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action_id", "backend", "status", "remote_response_id", "local_pid", "input_revision", "note"],
+      "properties": {
+        "action_id": {"anyOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "backend": {"enum": ["deep-think", "native"]},
+        "status": {"enum": ["queued", "running", "unknown"]},
+        "remote_response_id": {"type": ["string", "null"]},
+        "local_pid": {"type": ["integer", "null"], "minimum": 1},
+        "input_revision": {"type": ["integer", "null"], "minimum": 1},
+        "note": {"$ref": "#/$defs/text"}
+      }
+    }
+  }
+}

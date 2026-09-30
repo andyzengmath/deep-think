@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "record_type": "template",
+  "revision": 1,
+  "updated_at": "2026-09-07T13:20:17Z",
+  "project": {
+    "slug": "example-project",
+    "title": "Replace with the exact investigation title",
+    "workspace_root": "..\\..",
+    "evidence_root": "."
+  },
+  "mission": {
+    "statement": "Replace P with the exact mathematical question and its quantifiers.",
+    "status": "open",
+    "solution_node_ids": ["prove-p", "disprove-p"],
+    "resolution_node_id": null
+  },
+  "policy": {
+    "mode": "agent-maintained",
+    "selection": "best-first-with-bounded-dfs",
+    "episode_reasoning_turns": 3,
+    "active_strategy_limit": 3,
+    "plateau_episodes": 3,
+    "repeated_repairs": 2,
+    "allocation_percent": {
+      "developed": 50,
+      "bridge_or_alternative": 30,
+      "audit_consolidation": 20
+    }
+  },
+  "nodes": [
+    {
+      "id": "prove-p",
+      "kind": "goal",
+      "statement": "Prove P at the exact mission scope.",
+      "status": "open",
+      "scope": {"hypotheses": [], "fixed": [], "free": [], "quantities": []},
+      "assumption_ids": [],
+      "evidence_refs": [],
+      "acceptance_basis": null,
+      "non_claims": ["Replace this template scope before starting research."]
+    },
+    {
+      "id": "disprove-p",
+      "kind": "goal",
+      "statement": "Prove the negation of P at the exact mission scope.",
+      "status": "open",
+      "scope": {"hypotheses": [], "fixed": [], "free": [], "quantities": []},
+      "assumption_ids": [],
+      "evidence_refs": [],
+      "acceptance_basis": null,
+      "non_claims": ["An unsuccessful proof attempt does not establish this goal."]
+    }
+  ],
+  "inferences": [],
+  "actions": [],
+  "evidence": [],
+  "events": [],
+  "checkpoint": {
+    "research_status": "paused",
+    "reason": "Template only; no research action or spending is authorized.",
+    "frontier_action_ids": [],
+    "frontier_order": "unranked",
+    "next_steps": [
+      "Locate an existing project graph before creating a new one.",
+      "For a genuinely new project, replace the mission, slug, paths, scopes, and timestamp.",
+      "Set record_type to research-project and propose bounded actions."
+    ],
+    "jobs": [],
+    "last_recorded_research_turn": null
+  }
+}
