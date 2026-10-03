@@ -16,8 +16,9 @@ Use this reference when maintaining or debugging the runner.
 - Error/rate-limit fallbacks: GPT-6 backup resource, `gpt-5.6-sol`,
   `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro` on the legacy resource.
 - API: Responses
-- Authentication: `DefaultAzureCredential` and
-  `get_bearer_token_provider(..., "https://ai.azure.com/.default")`
+- Authentication: `DefaultAzureCredential(process_timeout=60)` and
+  `get_bearer_token_provider(..., "https://ai.azure.com/.default")`; the longer
+  subprocess timeout accommodates slow Azure CLI token commands.
 - GPT-6 and GPT-5.6 reasoning: `{"mode": "pro", "effort": "max",
   "context": "all_turns", "summary": "auto"}`
 - GPT-5.4 Pro fallback reasoning: `{"effort": "xhigh",
@@ -44,15 +45,27 @@ The fixed Entra scope above is a public protocol identifier, not a credential.
 
 Make at most five total submission attempts by default. Retry:
 
-- Connection and timeout exceptions.
-- Malformed SDK responses, including malformed HTTP 200 payloads detected by
-  explicit application-level validation before the response leaves the retry
-  loop.
+- Connection failures before the request is sent (`httpx.ConnectError`,
+  `ConnectTimeout`, or `PoolTimeout` beneath the SDK exception).
+- Malformed SDK responses after acceptance, including malformed HTTP 200
+  payloads detected by explicit application-level validation before the
+  response leaves the retry loop.
 - Empty completed responses.
-- HTTP 408, 409, 429, and 5xx responses.
+- HTTP 408, 409, 429, and non-gateway 5xx responses.
 - Submission-level HTTP 404 with exact code `DeploymentNotFound`.
 - Azure `server_error`, `too_many_requests`, `rate_limit_exceeded`,
   `no_capacity`, `timeout`, and `temporarily_unavailable` response codes.
+
+Do not retry an ambiguous submission. Record `submission_unknown` and stop for:
+read/write timeouts and disconnects after sending, gateway HTTP 502/504,
+interrupts during submission, and malformed success responses without a
+readable response ID. Azure documents no `Idempotency-Key` or client request
+correlation for Responses, and the OpenAI Python SDK sends no idempotency
+header, so a replacement could run the same paid request twice. Resolve it only
+with telemetry (`reconcile --attempt ATTEMPT --response-id ID`) or explicit
+operator confirmation (`reconcile --confirm-no-remote-job --reason TEXT`).
+Mandatory journaling cannot close the window in which Azure accepts a request
+but the client never receives its ID.
 
 On every retryable submission failure, advance through the primary GPT-6
 resource, backup GPT-6 resource, `gpt-5.6-sol`, `gpt-5.6-sol-nofilters`, and
@@ -112,7 +125,10 @@ items, and replay them with the next user message. Use 900,000 tokens as the
 volume ceiling, dynamically cap normal responses below it, and roll over before
 the remaining response budget falls below 25,000 tokens. This leaves room for
 the continuation-summary request and its output. Start a fresh local context
-from that summary rather than relying on remote response retention.
+from that summary rather than relying on remote response retention. Do not
+pay for a proactive rollover that cannot help: fail fast when even the smallest
+possible carried summary would leave too little room for the prompt, or when
+the same turn is retried from its own rollover checkpoint.
 
 If Azure still returns a context error, force one rollover and replay the
 uncommitted prompt exactly once. If opaque reasoning items cannot be replayed,
@@ -123,7 +139,12 @@ trigger visible-transcript recovery for unrelated 400s. Process a visible
 transcript that exceeds one request in 400,000-byte chunks and synthesize the
 chunk summaries; never silently truncate it. A proactive rollover does not
 consume the single reactive recovery allowance. Treat a second reactive context
-rejection after rollover as terminal.
+rejection after rollover as terminal. Checkpoints record whether they followed
+a proactive or reactive rollover, so the reactive allowance stays used when a
+turn resumes from its reactive checkpoint. If the answer after a reactive
+rollover fails deterministically (output or context limit, or invalid encrypted
+context), keep the completed rollover so a narrower prompt can continue from
+the new volume.
 
 The optional `--recover-service-errors` policy allows a terminal
 `status="failed"` / `error.code="server_error"` after bounded failover to trigger
@@ -150,6 +171,55 @@ reject mismatches so an interrupted multi-file commit or manual edit cannot
 silently corrupt continuation state. Current schema-version state files require
 all three digests; accept truly legacy state files once and migrate them on the
 next successful write.
+
+## Request journal and recovery
+
+Keep local writer state separate from remote request state:
+
+- `.deep-think.lock` records `lock_id`, PID, host, process start time, creation
+  time, and command. A lock whose process is gone (or whose PID now belongs to a
+  newer process) is stale and is replaced atomically. A lock from another host
+  or an unverifiable process requires `reconcile --release-lock`. Never probe
+  liveness with `os.kill` on Windows; it terminates processes there.
+- `requests/journal.jsonl` is append-only, one fsynced JSON record per event.
+  Before every submission, record the logical and attempt request SHA-256,
+  byte count, output budget, resource, deployment, and target ordinal. Record
+  the response ID before polling, each status change, the terminal outcome,
+  and the cached completed payload before the turn commits. A torn final line
+  from a crash is discarded and recorded; a corrupt complete line blocks work.
+- A dead writer does not prove its Azure job ended. Attempts with an intent but
+  no outcome become `submission_unknown` when their stale lock is recovered. A
+  stale pre-journal lock is recorded as an unresolved unknown writer.
+
+Each turn journals its prompt, deployment, and starting state digest. Re-running
+the identical prompt, or `resume`, continues that turn: a matching request
+fingerprint reuses a cached completion, polls an accepted ID on its original
+resource without an initial wait, and refuses to continue past an unresolved
+unknown submission. Failures that redirect the turn (output or context limits,
+invalid encrypted context, and service errors followed by visible-transcript
+recovery) are journaled and replayed without network calls, so the resumed
+turn follows the same path to its running job. Before any new submission,
+refuse if the turn still has a running job that the replay did not reach. A
+different prompt may supersede an unfinished turn only when no running,
+unknown, or completed-but-uncommitted request remains. Mid-turn checkpoints,
+including rollovers kept after a prompt proves too large, record the new state
+digest and mark completed results as persisted.
+
+`status` reads the lock, committed state, and journal without writing. `cancel`
+calls the background cancel endpoint on the original resource. Azure returns
+HTTP 400 ("Cannot cancel a completed response") for finished jobs, so retrieve
+the job after a failed cancel and record its actual state, caching completed
+output for `resume`. `reconcile`
+retrieves each active ID once, records terminal states, caches completed
+results for `resume`, and treats HTTP 404 on the journaled original resource as
+no longer running. An operator-attached ID must use the attempt's recorded
+resource; if it returns 404 before any successful observation, the attachment
+is rejected and the submission stays unknown. Background responses with
+`store=false` are retained for roughly 10 minutes after completion, so later
+results may be unrecoverable. A 404 for an ID outside the journal does not
+resolve anything, because the resource may be wrong. A retired stale lock is
+kept until its evidence is journaled, so a failed recovery cannot erase a
+pre-journal writer.
 
 ## Authoritative documentation
 

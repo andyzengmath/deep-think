@@ -59,13 +59,17 @@ primary operation; configure both GPT-6 endpoints for the full five-target chain
 Explicit legacy `--deployment` selections use the legacy resource and start
 at that model in the chain, without promoting back to GPT-6.
 
-Five total submission attempts are allowed by default. Retryable service,
-connection, timeout, malformed/empty response errors, and submission-level
-`DeploymentNotFound` 404s advance to the next target. Authentication,
-authorization, refusals, and ordinary invalid requests remain terminal.
-GPT-6 and GPT-5.6 use `pro`/`max`; GPT-5.4 Pro uses `xhigh` without
-unsupported reasoning mode/context options. Polling an accepted job never
-changes resources or resubmits the job, even if polling retries are exhausted.
+Five total submission attempts are allowed by default. Retryable service
+errors, connection failures before the request is sent, malformed/empty
+response errors, and submission-level `DeploymentNotFound` 404s advance to the
+next target. Authentication, authorization, refusals, and ordinary invalid
+requests remain terminal. Ambiguous submissions—read timeouts or disconnects
+after sending, gateway HTTP 502/504, interruptions, or a success response
+without a readable ID—stop as `submission_unknown` and are never resubmitted
+automatically. GPT-6 and GPT-5.6 use `pro`/`max`; GPT-5.4 Pro uses `xhigh`
+without unsupported reasoning mode/context options. Polling an accepted job
+never changes resources or resubmits the job, even if polling retries are
+exhausted.
 
 The values above last only for the current PowerShell process. If you automate
 them, use an operating-system, CI, or cloud configuration store outside the
@@ -140,8 +144,9 @@ per-job budget, not a deadline for the entire turn or all its summary requests.
 
 On expiry or exhausted retrieval retries, the runner stops and reports the
 response ID, deployment, and target ordinal. It does not cancel the remote job,
-switch resources, or submit a replacement. The job may still be running:
-retrieve that ID on its original resource before starting another attempt.
+switch resources, or submit a replacement. The job may still be running: the
+request journal keeps its ID and original resource, so continue polling it with
+`resume` (or stop it with `cancel`) instead of starting another attempt.
 
 For an existing project whose accepted jobs repeatedly finish with
 `status="failed"` and `error.code="server_error"`, explicitly enable recovery:
@@ -206,8 +211,24 @@ When installed as a repository skill, prefix paths with
   An available model listing does not prove a deployment with that name exists.
 - **HTTP 429 or transient errors:** the runner advances through the ordered
   chain above and starts the next logical request on the primary deployment.
+- **Project is already locked:** run `deep_think.py status --project SLUG`. A
+  lock held by a running process means wait. Locks left by dead processes are
+  recovered automatically; a lock from another host needs `reconcile
+  --release-lock` after you confirm that process exited. Never delete it.
+- **Submission outcome is unknown:** Azure may have accepted the request without
+  returning its ID. Search Azure telemetry using the attempt time, deployment,
+  resource, and request SHA-256 shown by `status`, then run `reconcile --attempt
+  ATTEMPT --response-id ID`, or `reconcile --confirm-no-remote-job --reason
+  TEXT` once you have verified that no job remains active.
+- **Unfinished turn blocks a new prompt:** run `resume` to finish it, `cancel`
+  to stop running jobs, or `reconcile --abandon-turn --reason TEXT`.
 - **Old model still selected:** clear an old `AZURE_OPENAI_DEPLOYMENT`
   override or set it to `gpt-6-astra`, then restart the terminal/agent.
 - **Credential chain selects the wrong account:** inspect `az account show`,
   choose the intended subscription, and log in again. Do not work around the
   issue by adding an API key.
+- **`AzureCliCredential: Failed to invoke the Azure CLI`:** check how long
+  `az account get-access-token --scope https://ai.azure.com/.default --output
+  none` takes. The runner allows developer-credential subprocesses 60 seconds
+  (the Azure SDK default is 10). Authentication failures are recorded as not
+  sent and are never retried against another target.

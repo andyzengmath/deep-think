@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 
 import argparse
+import getpass
 import hashlib
 import json
 import math
 import os
 import random
 import re
+import socket
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
@@ -84,6 +87,8 @@ DEFAULT_RETRY_MAX_DELAY = 30.0
 DEFAULT_REQUEST_TIMEOUT = 3600.0
 DEFAULT_POLL_INTERVAL = 2.0
 DEFAULT_POLL_TIMEOUT = 3600.0
+# azure-identity's 10-second default is too short for some Azure CLI installs.
+DEFAULT_CREDENTIAL_PROCESS_TIMEOUT = 60
 DEFAULT_FALLBACK_DEPLOYMENTS = (
     "gpt-5.6-sol",
     "gpt-5.6-sol-nofilters",
@@ -98,6 +103,21 @@ STATE_SCHEMA = "deep-think-state"
 LEGACY_STATE_VERSION = 1
 STATE_VERSION = 2
 PROJECT_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+LOCK_FILENAME = ".deep-think.lock"
+LOCK_SCHEMA = "deep-think-lock/v2"
+EMPTY_LOCK_GRACE_SECONDS = 60.0
+PROCESS_START_TOLERANCE_SECONDS = 2.0
+JOURNAL_DIRECTORY = "requests"
+JOURNAL_FILENAME = "journal.jsonl"
+JOURNAL_SCHEMA = "deep-think-request-journal/v1"
+ACTIVE_RESPONSE_STATUSES = frozenset({"queued", "in_progress"})
+TERMINAL_RESPONSE_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "incomplete"}
+)
+# Gateway errors can be returned after the service has accepted the request.
+AMBIGUOUS_HTTP_STATUS_CODES = frozenset({502, 504})
+OUTSTANDING_ATTEMPT_STATES = frozenset({"active", "unknown", "in_flight"})
+RESPONSE_FILENAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
 
 
 class DeepThinkError(RuntimeError):
@@ -124,6 +144,32 @@ class OpaqueReplayError(DeepThinkError):
 
 class TerminalServiceError(DeepThinkError):
     pass
+
+
+class RemoteStateError(DeepThinkError):
+    pass
+
+
+class SubmissionUnknownError(RemoteStateError):
+    pass
+
+
+class ProjectLockedError(DeepThinkError):
+    pass
+
+
+# Failures the turn pipeline recovers from by taking another path. They are
+# journaled so a resumed turn can follow the same path without resubmitting.
+REPLAYABLE_FAILURES = (
+    OutputLimitError,
+    ContextLimitError,
+    OpaqueReplayError,
+    TerminalServiceError,
+)
+# These describe the request itself, so the same request would fail again.
+DETERMINISTIC_FAILURES = frozenset(
+    {"OutputLimitError", "ContextLimitError", "OpaqueReplayError"}
+)
 
 
 class TurnResult:
@@ -516,7 +562,11 @@ def create_client(
                 "Install dependencies with: "
                 "python -m pip install --upgrade openai azure-identity"
             ) from error
-        credential_factory = credential_factory or DefaultAzureCredential
+        credential_factory = credential_factory or (
+            lambda: DefaultAzureCredential(
+                process_timeout=DEFAULT_CREDENTIAL_PROCESS_TIMEOUT
+            )
+        )
         token_provider_factory = token_provider_factory or get_bearer_token_provider
         openai_factory = openai_factory or OpenAI
 
@@ -534,9 +584,34 @@ def create_client(
     )
 
 
+class RouteTarget:
+    def __init__(self, deployment, client, resource=None, role=None):
+        self.deployment = deployment
+        self.client = client
+        self.resource = resource
+        self.role = role
+
+
 class DeploymentRouter:
-    def __init__(self, targets):
-        self.targets = targets
+    def __init__(self, targets, *, client_factory=None, clients=None):
+        self.targets = [
+            target if isinstance(target, RouteTarget) else RouteTarget(*target)
+            for target in targets
+        ]
+        self._client_factory = client_factory
+        self._clients = dict(clients or {})
+
+    def client_for(self, resource):
+        for target in self.targets:
+            if target.resource == resource:
+                return target.client
+        if resource not in self._clients:
+            if self._client_factory is None:
+                raise DeepThinkError(
+                    f"No client is configured for the recorded resource {resource!r}."
+                )
+            self._clients[resource] = self._client_factory(resource)
+        return self._clients[resource]
 
 
 def create_routed_client(
@@ -555,12 +630,159 @@ def create_routed_client(
             clients[resource] = client_factory(resource)
         return clients[resource]
 
-    targets = [(deployment, client_for(endpoint))]
+    targets = [RouteTarget(deployment, client_for(endpoint), endpoint, "primary")]
     if backup_endpoint:
-        targets.append((backup_deployment or deployment, client_for(backup_endpoint)))
+        targets.append(
+            RouteTarget(
+                backup_deployment or deployment,
+                client_for(backup_endpoint),
+                backup_endpoint,
+                "backup",
+            )
+        )
+    fallback_resource = fallback_endpoint or endpoint
     for fallback in _deployment_chain(deployment)[1:]:
-        targets.append((fallback, client_for(fallback_endpoint or endpoint)))
-    return DeploymentRouter(targets)
+        targets.append(
+            RouteTarget(
+                fallback, client_for(fallback_resource), fallback_resource, "fallback"
+            )
+        )
+    return DeploymentRouter(targets, client_factory=client_factory, clients=clients)
+
+
+def _target_for_attempt(router, attempt):
+    for index, target in enumerate(router.targets):
+        if (
+            target.deployment == attempt["deployment"]
+            and target.resource == attempt["resource"]
+        ):
+            return index, target
+    if attempt["resource"] is None:
+        raise DeepThinkError(
+            f"Recorded response {attempt['response_id']} has no resource and no "
+            "matching configured target."
+        )
+    return None, RouteTarget(
+        attempt["deployment"],
+        router.client_for(attempt["resource"]),
+        attempt["resource"],
+        attempt.get("role"),
+    )
+
+
+class SubmissionFailure:
+    def __init__(
+        self,
+        kind,
+        reason,
+        *,
+        http_status=None,
+        code=None,
+        message=None,
+        response_id=None,
+    ):
+        self.kind = kind
+        self.reason = reason
+        self.http_status = http_status
+        self.code = code
+        self.message = message
+        self.response_id = response_id
+
+
+def _is_credential_error(error):
+    try:
+        from azure.core.exceptions import ClientAuthenticationError
+    except ImportError:
+        return False
+    return isinstance(error, ClientAuthenticationError)
+
+
+def _classify_submission_error(error, connection_error, validation_error, status_error):
+    if isinstance(error, status_error):
+        status_code, code, message = _status_error_details(error)
+        if status_code in AMBIGUOUS_HTTP_STATUS_CODES:
+            return SubmissionFailure(
+                "unknown",
+                f"gateway HTTP {status_code}; Azure may have accepted the request",
+                http_status=status_code,
+                code=code,
+            )
+        return SubmissionFailure(
+            "rejected",
+            f"Azure HTTP {status_code}",
+            http_status=status_code,
+            code=code,
+            message=message,
+        )
+    if isinstance(error, validation_error):
+        body = getattr(error, "body", None)
+        response_id = body.get("id") if isinstance(body, dict) else None
+        if isinstance(response_id, str) and response_id:
+            return SubmissionFailure(
+                "accepted",
+                "malformed creation response with a response ID",
+                response_id=response_id,
+            )
+        return SubmissionFailure(
+            "unknown", "Azure returned a success response without a readable ID"
+        )
+    if isinstance(error, connection_error):
+        cause = error.__cause__
+        try:
+            import httpx
+
+            never_sent = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+        except ImportError:
+            never_sent = ()
+        if never_sent and isinstance(cause, never_sent):
+            return SubmissionFailure(
+                "not_sent", f"{type(cause).__name__} before the request was sent"
+            )
+        detail = type(cause).__name__ if cause is not None else "unknown cause"
+        return SubmissionFailure(
+            "unknown",
+            f"{type(error).__name__} ({detail}) after the request may have been sent",
+        )
+    if isinstance(error, Exception) and _is_credential_error(error):
+        return SubmissionFailure("auth", "Azure authentication failed before sending")
+    return SubmissionFailure("unknown", f"interrupted by {type(error).__name__}")
+
+
+def _safe_response_status(response):
+    try:
+        return _response_status(response)
+    except MalformedResponseError:
+        return None
+
+
+def _record_accepted(journal, attempt_id, response_id, status):
+    try:
+        journal.append(
+            "accepted",
+            attempt_id=attempt_id,
+            response_id=response_id,
+            status=status,
+        )
+    except DeepThinkError as error:
+        raise DeepThinkError(
+            f"Azure accepted response {response_id} (attempt {attempt_id}), but "
+            f"the request journal could not record it: {error} The job may still "
+            "be running. Once the journal is writable, run `reconcile --attempt "
+            f"{attempt_id} --response-id {response_id}`."
+        ) from error
+
+
+def _submission_unknown_message(purpose, target, attempt_id, reason):
+    return (
+        f"{purpose.capitalize()} submission outcome is unknown (attempt "
+        f"{attempt_id}, deployment {target.deployment}, resource "
+        f"{target.resource or 'configured client'}): {reason}. No replacement "
+        "request was sent: Azure documents no idempotency key for Responses, so "
+        "Azure may already be running this request. Find it in Azure telemetry and "
+        "run `reconcile --attempt ATTEMPT --response-id ID`, or, after verifying "
+        "that no job remains active, run `reconcile --confirm-no-remote-job "
+        "--reason TEXT`."
+    )
 
 
 def _poll_background_response(
@@ -577,6 +799,8 @@ def _poll_background_response(
     sleep,
     random_value,
     on_retry,
+    on_status=None,
+    initial_wait=True,
 ):
     try:
         from openai import (
@@ -590,11 +814,12 @@ def _poll_background_response(
             "python -m pip install --upgrade openai azure-identity"
         ) from error
 
-    if _response_status(response) not in {"queued", "in_progress"}:
+    if _response_status(response) not in ACTIVE_RESPONSE_STATUSES:
         return response, 0
     response_id = _response_id(response)
     job = f"response {response_id}, {target_label}"
     deadline = time.monotonic() + poll_timeout
+    last_status = _response_status(response)
 
     def remaining():
         seconds = deadline - time.monotonic()
@@ -611,8 +836,11 @@ def _poll_background_response(
         remaining()
 
     retry_count = 0
-    while _response_status(response) in {"queued", "in_progress"}:
-        wait(poll_interval)
+    first_poll = True
+    while _response_status(response) in ACTIVE_RESPONSE_STATUSES:
+        if initial_wait or not first_poll:
+            wait(poll_interval)
+        first_poll = False
         for attempt in range(1, max_attempts + 1):
             try:
                 retrieved = client.responses.retrieve(
@@ -650,6 +878,10 @@ def _poll_background_response(
                 else:
                     response = retrieved
                     retry_count += attempt - 1
+                    status = _response_status(response)
+                    if on_status is not None and status != last_status:
+                        on_status(status)
+                    last_status = status
                     break
 
             remaining()
@@ -681,7 +913,22 @@ def _poll_background_response(
     return response, retry_count
 
 
-def request_response(
+def request_response(client, request, *, journal=None, **options):
+    journal = journal if journal is not None else _NULL_JOURNAL
+    try:
+        return _request_response(client, request, journal=journal, **options)
+    except REPLAYABLE_FAILURES as error:
+        if not getattr(error, "replayed", False):
+            journal.append_best_effort(
+                "logical_failed",
+                logical_sha256=_sha256_text(_canonical_json_text(request)),
+                error_type=type(error).__name__,
+                message=str(error),
+            )
+        raise
+
+
+def _request_response(
     client,
     request,
     *,
@@ -694,6 +941,7 @@ def request_response(
     on_retry=None,
     poll_interval=DEFAULT_POLL_INTERVAL,
     poll_timeout=DEFAULT_POLL_TIMEOUT,
+    journal=None,
 ):
     _validate_retry_settings(max_attempts, base_delay, max_delay)
     _validate_poll_timeout(poll_timeout)
@@ -715,12 +963,28 @@ def request_response(
             "python -m pip install --upgrade openai azure-identity"
         ) from error
 
+    journal = journal if journal is not None else _NULL_JOURNAL
     request_has_encrypted_content = _request_contains_encrypted_content(request)
-    targets = (
-        client.targets
+    router = (
+        client
         if isinstance(client, DeploymentRouter)
-        else [(name, client) for name in _deployment_chain(request["model"])]
+        else DeploymentRouter(
+            [(name, client) for name in _deployment_chain(request["model"])]
+        )
     )
+    targets = router.targets
+    logical_sha256 = _sha256_text(_canonical_json_text(request))
+    reuse = journal.reusable_attempt(logical_sha256)
+    if reuse is not None and reuse.response is not None:
+        return RequestOutcome(
+            reuse.response,
+            reuse.retry_count,
+            reuse.attempt["deployment"],
+        )
+    if reuse is None:
+        replayed = journal.replayable_failure(logical_sha256)
+        if replayed is not None:
+            raise replayed
     deployment_index = 0
     poll_retry_count = 0
 
@@ -728,89 +992,169 @@ def request_response(
         nonlocal deployment_index
         deployment_index = (deployment_index + 1) % len(targets)
         reason += (
-            f"; switching deployment to {targets[deployment_index][0]}"
+            f"; switching deployment to {targets[deployment_index].deployment}"
             f" (target {deployment_index + 1}/{len(targets)})"
         )
         _retry_event(purpose, attempt, max_attempts, reason, delay, on_retry)
         sleep(delay)
 
     for attempt in range(1, max_attempts + 1):
-        active_deployment, active_client = targets[deployment_index]
-        target_label = (
-            f"deployment {active_deployment}, "
-            f"target {deployment_index + 1}/{len(targets)}"
-        )
-        attempt_request = _request_for_deployment(request, active_deployment)
-        try:
-            response = active_client.responses.create(**attempt_request)
-        except APIResponseValidationError as error:
-            if attempt >= max_attempts:
-                raise DeepThinkError(
-                    f"{purpose.capitalize()} request failed after "
-                    f"{attempt} attempts: malformed Azure response"
-                ) from error
-            delay = _retry_delay(
-                None,
-                attempt,
-                base_delay,
-                max_delay,
-                random_value,
+        resumed = reuse is not None
+        if resumed:
+            known = reuse.attempt
+            reuse = None
+            target_index, active = _target_for_attempt(router, known)
+            if target_index is not None:
+                deployment_index = target_index
+            attempt_id = known["attempt_id"]
+            response_id = known["response_id"]
+            attempt_request = _request_for_deployment(request, active.deployment)
+            target_label = (
+                f"deployment {active.deployment}, target "
+                f"{known.get('target_index')}/{known.get('target_count')}"
             )
-            retry_next("malformed Azure response", delay)
-            continue
-        except APIConnectionError as error:
-            if attempt >= max_attempts:
-                raise DeepThinkError(
-                    f"{purpose.capitalize()} request failed after "
-                    f"{attempt} attempts: {error}"
-                ) from error
-            delay = _retry_delay(
-                error,
-                attempt,
-                base_delay,
-                max_delay,
-                random_value,
+            journal.append(
+                "polling_resumed",
+                attempt_id=attempt_id,
+                response_id=response_id,
             )
-            retry_next(type(error).__name__, delay)
-            continue
-        except APIStatusError as error:
-            status_code, code, message = _status_error_details(error)
-            reason = f"Azure HTTP {status_code}"
-            if code:
-                reason += f" ({code})"
-            if _status_error_is_opaque_replay(error, request_has_encrypted_content):
-                raise OpaqueReplayError(
-                    f"{purpose.capitalize()} request could not replay encrypted "
-                    "reasoning context."
-                ) from error
-            if _status_error_is_context_limit(error):
-                raise ContextLimitError(
-                    f"{purpose.capitalize()} request exceeded the context "
-                    f"limit: {reason}: {message}"
-                ) from error
-            deployment_missing = status_code == 404 and code == "DeploymentNotFound"
-            if not (_status_error_is_retryable(error) or deployment_missing):
-                raise DeepThinkError(
-                    f"{purpose.capitalize()} request failed without retry: "
-                    f"{reason}: {message}"
-                ) from error
-            if attempt >= max_attempts:
-                raise DeepThinkError(
-                    f"{purpose.capitalize()} request failed after "
-                    f"{attempt} attempts: {reason}: {message}"
-                ) from error
-            delay = _retry_delay(
-                error,
-                attempt,
-                base_delay,
-                max_delay,
-                random_value,
+            response = {"id": response_id, "status": "queued"}
+        else:
+            active = targets[deployment_index]
+            target_label = (
+                f"deployment {active.deployment}, "
+                f"target {deployment_index + 1}/{len(targets)}"
             )
-            retry_next(reason, delay)
-            continue
+            attempt_request = _request_for_deployment(request, active.deployment)
+            journal.ensure_no_unreached_active(logical_sha256)
+            attempt_id = journal.begin_attempt(
+                purpose=purpose,
+                attempt=attempt,
+                logical_sha256=logical_sha256,
+                request=attempt_request,
+                target=active,
+                target_index=deployment_index + 1,
+                target_count=len(targets),
+            )
+            try:
+                response = active.client.responses.create(**attempt_request)
+            except BaseException as error:
+                failure = _classify_submission_error(
+                    error,
+                    APIConnectionError,
+                    APIResponseValidationError,
+                    APIStatusError,
+                )
+                if failure.kind == "unknown":
+                    if not isinstance(error, Exception):
+                        journal.append_best_effort(
+                            "submission_unknown",
+                            attempt_id=attempt_id,
+                            reason=failure.reason,
+                        )
+                        raise
+                    journal.append(
+                        "submission_unknown",
+                        attempt_id=attempt_id,
+                        reason=failure.reason,
+                    )
+                    raise SubmissionUnknownError(
+                        _submission_unknown_message(
+                            purpose, active, attempt_id, failure.reason
+                        )
+                    ) from error
+                if failure.kind == "accepted":
+                    response_id = failure.response_id
+                    _record_accepted(journal, attempt_id, response_id, None)
+                    response = {"id": response_id, "status": "queued"}
+                else:
+                    journal.append(
+                        "rejected" if failure.kind == "rejected" else "not_sent",
+                        attempt_id=attempt_id,
+                        reason=failure.reason,
+                        http_status=failure.http_status,
+                        code=failure.code,
+                    )
+                    if failure.kind == "auth":
+                        raise DeepThinkError(
+                            f"{purpose.capitalize()} request was not sent because "
+                            f"Azure authentication failed: {error}"
+                        ) from error
+                    if failure.kind == "not_sent":
+                        if attempt >= max_attempts:
+                            raise DeepThinkError(
+                                f"{purpose.capitalize()} request failed after "
+                                f"{attempt} attempts: {error}"
+                            ) from error
+                        delay = _retry_delay(
+                            error,
+                            attempt,
+                            base_delay,
+                            max_delay,
+                            random_value,
+                        )
+                        retry_next(type(error).__name__, delay)
+                        continue
+                    status_code, code, message = (
+                        failure.http_status,
+                        failure.code,
+                        failure.message,
+                    )
+                    reason = f"Azure HTTP {status_code}"
+                    if code:
+                        reason += f" ({code})"
+                    if _status_error_is_opaque_replay(
+                        error, request_has_encrypted_content
+                    ):
+                        raise OpaqueReplayError(
+                            f"{purpose.capitalize()} request could not replay "
+                            "encrypted reasoning context."
+                        ) from error
+                    if _status_error_is_context_limit(error):
+                        raise ContextLimitError(
+                            f"{purpose.capitalize()} request exceeded the context "
+                            f"limit: {reason}: {message}"
+                        ) from error
+                    deployment_missing = (
+                        status_code == 404 and code == "DeploymentNotFound"
+                    )
+                    if not (_status_error_is_retryable(error) or deployment_missing):
+                        raise DeepThinkError(
+                            f"{purpose.capitalize()} request failed without retry: "
+                            f"{reason}: {message}"
+                        ) from error
+                    if attempt >= max_attempts:
+                        raise DeepThinkError(
+                            f"{purpose.capitalize()} request failed after "
+                            f"{attempt} attempts: {reason}: {message}"
+                        ) from error
+                    delay = _retry_delay(
+                        error,
+                        attempt,
+                        base_delay,
+                        max_delay,
+                        random_value,
+                    )
+                    retry_next(reason, delay)
+                    continue
+            else:
+                try:
+                    response_id = _response_id(response)
+                except MalformedResponseError as error:
+                    reason = "the creation response had no valid response ID"
+                    journal.append(
+                        "submission_unknown", attempt_id=attempt_id, reason=reason
+                    )
+                    raise SubmissionUnknownError(
+                        _submission_unknown_message(purpose, active, attempt_id, reason)
+                    ) from error
+                status = _safe_response_status(response)
+                _record_accepted(journal, attempt_id, response_id, status)
+                if status is None:
+                    response = {"id": response_id, "status": "queued"}
         try:
             response, retries = _poll_background_response(
-                active_client,
+                active.client,
                 response,
                 purpose=purpose,
                 max_attempts=max_attempts,
@@ -822,8 +1166,28 @@ def request_response(
                 sleep=sleep,
                 random_value=random_value,
                 on_retry=on_retry,
+                on_status=lambda status, current=attempt_id: journal.append(
+                    "poll_status", attempt_id=current, status=status
+                ),
+                initial_wait=not resumed,
             )
-            poll_retry_count += retries
+        except BaseException as error:
+            journal.append_best_effort(
+                "poll_stopped",
+                attempt_id=attempt_id,
+                response_id=response_id,
+                reason=f"{type(error).__name__}: {error}",
+            )
+            if isinstance(error, Exception) and _is_credential_error(error):
+                raise DeepThinkError(
+                    f"{purpose.capitalize()} polling of response {response_id} "
+                    "stopped because Azure authentication failed. The job may "
+                    "still be running; fix authentication, then run `resume`."
+                ) from error
+            raise
+        poll_retry_count += retries
+        journal.record_terminal(attempt_id, response)
+        try:
             refusal = _response_refusal_text(response)
             if refusal is not None:
                 raise DeepThinkError(
@@ -836,12 +1200,14 @@ def request_response(
                 _response_id(response)
                 _response_usage(response)
                 _response_output(response)
+                journal.save_completion(attempt_id, response)
                 return RequestOutcome(
                     response,
                     attempt - 1 + poll_retry_count,
-                    active_deployment,
+                    active.deployment,
                 )
             if status == "completed" and attempt < max_attempts:
+                journal.append("discarded", attempt_id=attempt_id, reason="empty")
                 delay = _retry_delay(
                     None,
                     attempt,
@@ -852,6 +1218,7 @@ def request_response(
                 retry_next("empty response", delay)
                 continue
             if status == "completed":
+                journal.append("discarded", attempt_id=attempt_id, reason="empty")
                 raise DeepThinkError(
                     f"{purpose.capitalize()} request failed after "
                     f"{attempt} attempts: empty response"
@@ -912,6 +1279,7 @@ def request_response(
                 f"response {status}{code_text}: {response_message}"
             )
         except MalformedResponseError as error:
+            journal.append("discarded", attempt_id=attempt_id, reason="malformed")
             if attempt >= max_attempts:
                 raise DeepThinkError(
                     f"{purpose.capitalize()} request failed after "
@@ -995,6 +1363,8 @@ def _atomic_write_text(path, content):
         ) as temporary_file:
             temporary_path = Path(temporary_file.name)
             temporary_file.write(content)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
     except OSError as error:
         cleanup_error = _cleanup_temporary_file(temporary_path)
         raise _atomic_write_error(
@@ -1414,47 +1784,975 @@ def _write_pending_state(
     _write_json(state_path, state)
 
 
-@contextmanager
-def _project_lock(root, project):
-    project_dir = Path(root) / project
-    project_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = project_dir / ".deep-think.lock"
+def _file_sha256(path):
     try:
-        descriptor = os.open(
-            lock_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-        )
-    except FileExistsError as error:
-        try:
-            owner = lock_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            owner = "owner unavailable"
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise DeepThinkError(f"Could not checksum {path}: {error}") from error
+
+
+def _parse_timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _operator_name():
+    try:
+        return getpass.getuser()
+    except (ImportError, KeyError, OSError):
+        return None
+
+
+class CachedResponse:
+    """A completed response restored from the local request journal."""
+
+    def __init__(self, payload):
+        self.id = payload["id"]
+        self.status = payload["status"]
+        self.output_text = payload["output_text"]
+        self.output = payload["output"]
+        self.usage = payload["usage"]
+        self.error = None
+        self.incomplete_details = None
+
+
+def _serialize_completed_response(response):
+    usage = _response_usage(response)
+    return {
+        "id": _response_id(response),
+        "status": _response_status(response),
+        "output_text": _response_text(response),
+        "output": _response_output(response),
+        "usage": {
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "total_tokens": usage["total_tokens"],
+            "output_tokens_details": {"reasoning_tokens": usage["reasoning_tokens"]},
+        },
+    }
+
+
+class ReusableAttempt:
+    def __init__(self, attempt, response=None, retry_count=0):
+        self.attempt = attempt
+        self.response = response
+        self.retry_count = retry_count
+
+
+def _read_journal(path):
+    try:
+        data = Path(path).read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return [], False
+    except OSError as error:
         raise DeepThinkError(
-            f"Project is already locked by another process: {owner}. "
-            "If that process crashed, remove the lock file after confirming "
-            "no deep-think request is still running."
+            f"Could not read request journal {path}: {error}"
         ) from error
-
-    try:
-        os.write(
-            descriptor,
-            json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "created_at": _utc_now(),
-                }
-            ).encode("utf-8"),
-        )
-    finally:
-        os.close(descriptor)
-
-    try:
-        yield
-    finally:
+    torn_tail = bool(data) and not data.endswith(b"\n")
+    records = []
+    for number, line in enumerate(data.split(b"\n")[:-1], start=1):
+        if not line.strip():
+            continue
         try:
-            lock_path.unlink()
+            record = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise DeepThinkError(
+                f"Request journal {path} line {number} is corrupt: {error}. "
+                "Inspect it before submitting further requests."
+            ) from error
+        if not isinstance(record, dict) or record.get("schema") != JOURNAL_SCHEMA:
+            raise DeepThinkError(
+                f"Request journal {path} line {number} is corrupt: unexpected "
+                "record format."
+            )
+        records.append(record)
+    return records, torn_tail
+
+
+ATTEMPT_RECORD_FIELDS = (
+    "attempt_id",
+    "turn_id",
+    "lock_id",
+    "purpose",
+    "attempt",
+    "logical_sha256",
+    "request_sha256",
+    "request_bytes",
+    "max_output_tokens",
+    "deployment",
+    "resource",
+    "role",
+    "target_index",
+    "target_count",
+)
+
+
+class JournalView:
+    """Derived local and remote request state replayed from the journal."""
+
+    def __init__(self, records, *, torn_tail=False):
+        self.records = records
+        self.torn_tail = torn_tail
+        self.turns = {}
+        self.attempts = {}
+        self.legacy_items = {}
+        self.logical_failures = {}
+        self._sequence = 0
+        for record in records:
+            self._sequence += 1
+            self._apply(record)
+
+    def _apply(self, record):
+        event = record.get("event")
+        turn = self.turns.get(record.get("turn_id"))
+        if event == "turn_started":
+            self.turns[record.get("turn_id")] = {
+                "turn_id": record.get("turn_id"),
+                "started_at": record.get("recorded_at"),
+                "prompt_sha256": record.get("prompt_sha256"),
+                "prompt_file": record.get("prompt_file"),
+                "base_state_sha256": record.get("base_state_sha256"),
+                "deployment": record.get("deployment"),
+                "title": record.get("title"),
+                "rollover_tokens": record.get("rollover_tokens"),
+                "recover_service_errors": record.get("recover_service_errors"),
+                "checkpoints": [],
+                "checkpoint_kinds": {},
+                "state": "open",
+                "last_error": None,
+            }
+        elif event == "turn_checkpoint" and turn is not None:
+            turn["checkpoints"].append(record.get("state_sha256"))
+            turn["checkpoint_kinds"][record.get("state_sha256")] = (
+                record.get("kind") or "proactive"
+            )
+            for attempt in self.turn_attempts(turn["turn_id"]):
+                if attempt["terminal_status"] == "completed" and attempt["payload"]:
+                    attempt["persisted"] = True
+        elif event == "turn_error" and turn is not None:
+            turn["last_error"] = record.get("error")
+        elif event == "turn_committed" and turn is not None:
+            turn["state"] = "committed"
+        elif event in {"turn_superseded", "turn_abandoned"} and turn is not None:
+            turn["state"] = "abandoned"
+        elif event == "submitting":
+            attempt = {key: record.get(key) for key in ATTEMPT_RECORD_FIELDS}
+            attempt.update(
+                submitted_at=record.get("recorded_at"),
+                sequence=self._sequence,
+                outcome=None,
+                response_id=None,
+                last_status=None,
+                terminal_status=None,
+                payload=None,
+                payload_sha256=None,
+                poll_stopped=None,
+                resolution=None,
+                reason=None,
+                discarded=False,
+                persisted=False,
+                attached_unverified=False,
+            )
+            self.attempts[attempt["attempt_id"]] = attempt
+        elif event == "logical_failed":
+            self.logical_failures[
+                (record.get("turn_id"), record.get("logical_sha256"))
+            ] = {
+                "error_type": record.get("error_type"),
+                "message": record.get("message"),
+                "sequence": self._sequence,
+            }
+        elif event == "legacy_writer_unknown":
+            self.legacy_items[record.get("item_id")] = {
+                "item_id": record.get("item_id"),
+                "recorded_at": record.get("recorded_at"),
+                "previous_owner": record.get("previous_owner"),
+                "resolved": False,
+            }
+        elif event in {"operator_confirmed_no_remote_job", "legacy_resolved"}:
+            for attempt_id in record.get("attempt_ids") or []:
+                if attempt_id in self.attempts:
+                    self.attempts[attempt_id]["resolution"] = "confirmed_no_remote_job"
+            for item_id in record.get("item_ids") or []:
+                if item_id in self.legacy_items:
+                    self.legacy_items[item_id]["resolved"] = True
+        else:
+            self._apply_attempt_event(event, record)
+
+    def _apply_attempt_event(self, event, record):
+        attempt = self.attempts.get(record.get("attempt_id"))
+        if attempt is None:
+            return
+        status = record.get("status")
+        if event in {"poll_status", "terminal", "cancel_requested", "completed"}:
+            attempt["attached_unverified"] = False
+        if event == "accepted":
+            attempt.update(
+                outcome="accepted",
+                response_id=record.get("response_id"),
+                last_status=status,
+            )
+        elif event in {"rejected", "not_sent"}:
+            attempt.update(outcome=event, reason=record.get("reason"))
+        elif event == "submission_unknown" and attempt["outcome"] in {None, "unknown"}:
+            attempt.update(outcome="unknown", reason=record.get("reason"))
+        elif event == "operator_attached":
+            attempt.update(
+                outcome="accepted",
+                response_id=record.get("response_id"),
+                resource=record.get("resource", attempt["resource"]),
+                last_status=None,
+                attached_unverified=True,
+            )
+        elif event == "attachment_rejected":
+            attempt.update(
+                outcome="unknown",
+                response_id=None,
+                attached_unverified=False,
+                reason=record.get("reason"),
+            )
+        elif event in {"poll_status", "terminal", "cancel_requested"}:
+            if status is not None:
+                attempt["last_status"] = status
+            if status in TERMINAL_RESPONSE_STATUSES:
+                attempt["terminal_status"] = status
+        elif event == "completed":
+            attempt.update(
+                terminal_status="completed",
+                last_status="completed",
+                payload=record.get("payload"),
+                payload_sha256=record.get("payload_sha256"),
+            )
+        elif event == "poll_stopped":
+            attempt["poll_stopped"] = record.get("reason")
+        elif event == "discarded":
+            attempt["discarded"] = True
+        elif event == "remote_unavailable":
+            attempt["resolution"] = "unavailable"
+
+    @staticmethod
+    def attempt_state(attempt, live_lock_id=None):
+        if attempt["resolution"] is not None:
+            return "resolved"
+        if attempt["outcome"] in {"rejected", "not_sent"}:
+            return "not_created"
+        if attempt["terminal_status"] is not None:
+            return "terminal"
+        if attempt["outcome"] == "accepted":
+            return "active"
+        if attempt["outcome"] is None and attempt["lock_id"] == live_lock_id:
+            return "in_flight"
+        return "unknown"
+
+    def open_turn(self):
+        for turn in reversed(list(self.turns.values())):
+            if turn["state"] == "open":
+                return turn
+        return None
+
+    def turn_attempts(self, turn_id):
+        return [a for a in self.attempts.values() if a["turn_id"] == turn_id]
+
+    def outstanding(self, live_lock_id=None):
+        return [
+            attempt
+            for attempt in self.attempts.values()
+            if self.attempt_state(attempt, live_lock_id) in OUTSTANDING_ATTEMPT_STATES
+        ]
+
+    def unresolved_legacy(self):
+        return [item for item in self.legacy_items.values() if not item["resolved"]]
+
+    def recoverable(self, turn_id):
+        turn = self.turns.get(turn_id)
+        if turn is None or turn["state"] != "open":
+            return []
+        return [
+            attempt
+            for attempt in self.turn_attempts(turn_id)
+            if attempt["terminal_status"] == "completed"
+            and attempt["payload"]
+            and not attempt["discarded"]
+            and not attempt["persisted"]
+            and attempt["resolution"] is None
+        ]
+
+    def attempt_for_response(self, response_id):
+        matches = [a for a in self.attempts.values() if a["response_id"] == response_id]
+        return matches[-1] if matches else None
+
+    def replayable_failure(self, turn_id, logical_sha256):
+        failure = self.logical_failures.get((turn_id, logical_sha256))
+        if failure is None:
+            return None
+        later = [
+            attempt
+            for attempt in self.attempts.values()
+            if attempt["turn_id"] == turn_id
+            and attempt["sequence"] > failure["sequence"]
+        ]
+        # A later retry of the same request supersedes the recorded failure.
+        if any(attempt["logical_sha256"] == logical_sha256 for attempt in later):
+            return None
+        if failure["error_type"] in DETERMINISTIC_FAILURES:
+            return failure
+        # A transient failure is replayed only if the turn then moved on.
+        return failure if later else None
+
+
+class RequestJournal:
+    """Append-only, fsynced record of every Azure submission for one project."""
+
+    def __init__(self, project_dir, *, lock_id=None):
+        self.directory = Path(project_dir) / JOURNAL_DIRECTORY
+        self.path = self.directory / JOURNAL_FILENAME
+        self.lock_id = lock_id
+        self.turn_id = None
+        self._tail_checked = False
+
+    def _failure(self, error):
+        return DeepThinkError(
+            f"Could not durably write request journal {self.path}: {error}"
+        )
+
+    def _repair_torn_tail(self):
+        self._tail_checked = True
+        try:
+            with open(self.path, "r+b") as stream:
+                data = stream.read()
+                if not data or data.endswith(b"\n"):
+                    return
+                cut = data.rfind(b"\n") + 1
+                discarded = data[cut:]
+                stream.seek(cut)
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
         except FileNotFoundError:
+            return
+        except OSError as error:
+            raise self._failure(error) from error
+        self.append(
+            "torn_record_discarded",
+            bytes=len(discarded),
+            sha256=hashlib.sha256(discarded).hexdigest(),
+        )
+
+    def append(self, event, **fields):
+        record = {
+            "schema": JOURNAL_SCHEMA,
+            "event": event,
+            "recorded_at": _utc_now(),
+            "lock_id": self.lock_id,
+            "turn_id": self.turn_id,
+        }
+        record.update(fields)
+        data = (_canonical_json_text(record) + "\n").encode("utf-8")
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise self._failure(error) from error
+        if not self._tail_checked:
+            self._repair_torn_tail()
+        try:
+            with open(self.path, "ab") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as error:
+            raise self._failure(error) from error
+        return record
+
+    def append_best_effort(self, event, **fields):
+        try:
+            return self.append(event, **fields)
+        except DeepThinkError:
+            return None
+
+    def view(self):
+        records, torn_tail = _read_journal(self.path)
+        return JournalView(records, torn_tail=torn_tail)
+
+    def begin_attempt(
+        self,
+        *,
+        purpose,
+        attempt,
+        logical_sha256,
+        request,
+        target,
+        target_index,
+        target_count,
+    ):
+        attempt_id = uuid.uuid4().hex
+        body = _canonical_json_text(request).encode("utf-8")
+        self.append(
+            "submitting",
+            attempt_id=attempt_id,
+            purpose=purpose,
+            attempt=attempt,
+            logical_sha256=logical_sha256,
+            request_sha256=hashlib.sha256(body).hexdigest(),
+            request_bytes=len(body),
+            max_output_tokens=request.get("max_output_tokens"),
+            deployment=target.deployment,
+            resource=target.resource,
+            role=target.role,
+            target_index=target_index,
+            target_count=target_count,
+            pid=os.getpid(),
+        )
+        return attempt_id
+
+    def reusable_attempt(self, logical_sha256):
+        if self.turn_id is None:
+            return None
+        view = self.view()
+        candidates = [
+            attempt
+            for attempt in view.turn_attempts(self.turn_id)
+            if attempt["logical_sha256"] == logical_sha256
+        ]
+        for attempt in candidates:
+            if view.attempt_state(attempt) == "unknown":
+                raise SubmissionUnknownError(
+                    _submission_unknown_message(
+                        attempt["purpose"] or "request",
+                        RouteTarget(attempt["deployment"], None, attempt["resource"]),
+                        attempt["attempt_id"],
+                        attempt["reason"]
+                        or "the writer stopped before recording the outcome",
+                    )
+                )
+        reusable = [a for a in candidates if not a["discarded"]]
+        for index, attempt in reversed(list(enumerate(reusable))):
+            if attempt["resolution"] is None and attempt["payload"]:
+                response = self.load_completion(attempt)
+                if response is not None:
+                    return ReusableAttempt(attempt, response, index)
+        for state, status in (("active", None), ("terminal", "completed")):
+            for attempt in reversed(reusable):
+                if view.attempt_state(attempt) == state and (
+                    status is None or attempt["terminal_status"] == status
+                ):
+                    return ReusableAttempt(attempt)
+        return None
+
+    def replayable_failure(self, logical_sha256):
+        if self.turn_id is None:
+            return None
+        failure = self.view().replayable_failure(self.turn_id, logical_sha256)
+        if failure is None:
+            return None
+        error_type = {cls.__name__: cls for cls in REPLAYABLE_FAILURES}.get(
+            failure["error_type"]
+        )
+        if error_type is None:
+            return None
+        message = f"{failure['message']} (replayed from the request journal)"
+        error = (
+            OutputLimitError(message, None)
+            if error_type is OutputLimitError
+            else error_type(message)
+        )
+        error.replayed = True
+        return error
+
+    def ensure_no_unreached_active(self, logical_sha256):
+        if self.turn_id is None:
+            return
+        view = self.view()
+        running = [
+            attempt["response_id"]
+            for attempt in view.turn_attempts(self.turn_id)
+            if view.attempt_state(attempt) == "active"
+            and attempt["logical_sha256"] != logical_sha256
+        ]
+        if running:
+            raise RemoteStateError(
+                "The unfinished turn still has running request(s) "
+                f"{', '.join(running)} that this run did not reach; another "
+                "submission could duplicate paid work. Run `resume`, which reuses "
+                "the turn's recorded options, or use `cancel` or `reconcile`."
+            )
+
+    def record_terminal(self, attempt_id, response):
+        try:
+            response_id = _response_id(response)
+        except MalformedResponseError:
+            response_id = None
+        try:
+            codes, message = _response_error_details(response)
+        except MalformedResponseError:
+            codes, message = set(), None
+        try:
+            usage = _response_usage(response)
+        except MalformedResponseError:
+            usage = None
+        self.append(
+            "terminal",
+            attempt_id=attempt_id,
+            response_id=response_id,
+            status=_safe_response_status(response),
+            error_codes=sorted(codes),
+            error_message=message if codes else None,
+            usage=usage,
+        )
+
+    def save_completion(self, attempt_id, response):
+        payload = _serialize_completed_response(response)
+        response_id = payload["id"]
+        name = (
+            f"{response_id}.json"
+            if RESPONSE_FILENAME_PATTERN.fullmatch(response_id)
+            else f"{attempt_id}.response.json"
+        )
+        text = _json_text(payload)
+        try:
+            _atomic_write_text(self.directory / name, text)
+        except DeepThinkError as error:
+            raise DeepThinkError(
+                f"Response {response_id} completed, but the request journal could "
+                f"not cache it: {error}"
+            ) from error
+        self.append(
+            "completed",
+            attempt_id=attempt_id,
+            response_id=response_id,
+            payload=name,
+            payload_sha256=_sha256_text(text),
+        )
+
+    def load_completion(self, attempt):
+        try:
+            text = (self.directory / attempt["payload"]).read_bytes().decode("utf-8")
+            if _sha256_text(text) != attempt["payload_sha256"]:
+                return None
+            response = CachedResponse(json.loads(text))
+            _response_id(response)
+            _response_usage(response)
+            _response_output(response)
+        except (OSError, UnicodeError, KeyError, TypeError, ValueError):
+            return None
+        except MalformedResponseError:
+            return None
+        return response if response.output_text.strip() else None
+
+    def save_prompt(self, turn_id, prompt):
+        name = f"{turn_id}.prompt.txt"
+        try:
+            _atomic_write_text(self.directory / name, prompt)
+        except DeepThinkError as error:
+            raise DeepThinkError(
+                f"Could not record the turn prompt in the request journal: {error}"
+            ) from error
+        return name
+
+    def read_prompt(self, turn):
+        try:
+            prompt = (
+                (self.directory / (turn["prompt_file"] or ""))
+                .read_bytes()
+                .decode("utf-8")
+            )
+        except (OSError, UnicodeError) as error:
+            raise DeepThinkError(
+                f"The unfinished turn's journaled prompt is unavailable: {error}"
+            ) from error
+        if _sha256_text(prompt) != turn["prompt_sha256"]:
+            raise DeepThinkError(
+                "The unfinished turn's journaled prompt does not match its checksum."
+            )
+        return prompt
+
+    def release_payloads(self, turn_id):
+        for attempt in self.view().turn_attempts(turn_id):
+            if attempt["payload"]:
+                try:
+                    (self.directory / attempt["payload"]).unlink()
+                except OSError:
+                    pass
+
+    def release_turn_artifacts(self, turn_id):
+        self.release_payloads(turn_id)
+        turn = self.view().turns.get(turn_id)
+        if turn is not None and turn["prompt_file"]:
+            try:
+                (self.directory / turn["prompt_file"]).unlink()
+            except OSError:
+                pass
+
+
+class _NullJournal:
+    """Used only by direct library calls that are not tied to a project."""
+
+    turn_id = None
+
+    def append(self, event, **fields):
+        return None
+
+    def append_best_effort(self, event, **fields):
+        return None
+
+    def begin_attempt(self, **fields):
+        return uuid.uuid4().hex
+
+    def reusable_attempt(self, logical_sha256):
+        return None
+
+    def replayable_failure(self, logical_sha256):
+        return None
+
+    def ensure_no_unreached_active(self, logical_sha256):
+        return None
+
+    def record_terminal(self, attempt_id, response):
+        return None
+
+    def save_completion(self, attempt_id, response):
+        return None
+
+
+_NULL_JOURNAL = _NullJournal()
+
+
+class WriterLock:
+    def __init__(self, path, owner, recovered=None):
+        self.path = path
+        self.owner = owner
+        self.lock_id = owner["lock_id"]
+        self.recovered = recovered
+
+
+def _windows_process_liveness(pid):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+        ctypes.POINTER(wintypes.FILETIME)
+    ] * 4
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    process_query_limited_information = 0x1000
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: no such process
+            return False, None
+        if error == 5:  # ERROR_ACCESS_DENIED: the process exists
+            return True, None
+        return None, None
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return None, None
+        if exit_code.value != 259:  # STILL_ACTIVE
+            return False, None
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(
+            handle, *(ctypes.byref(item) for item in times)
+        ):
+            return True, None
+        ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        started = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(
+            microseconds=ticks // 10
+        )
+        return True, started
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_liveness(pid):
+    """Return (alive, start time); alive is None when it cannot be determined."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None, None
+    if os.name == "nt":
+        try:
+            return _windows_process_liveness(pid)
+        except (AttributeError, OSError, ValueError):
+            return None, None
+    # Never use os.kill for probing on Windows: it terminates the process there.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, None
+    except PermissionError:
+        return True, None
+    except OSError:
+        return None, None
+    return True, None
+
+
+def _current_process_started_at():
+    alive, started = _process_liveness(os.getpid())
+    return started.isoformat() if alive and started is not None else None
+
+
+def _inspect_lock(path):
+    path = Path(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+        modified = path.stat().st_mtime
+    except FileNotFoundError:
+        return {"state": "none", "owner": None, "legacy_format": False}
+    except (OSError, UnicodeError) as error:
+        return {
+            "state": "unverifiable",
+            "reason": f"the lock file is unreadable: {error}",
+            "owner": None,
+            "raw": None,
+            "legacy_format": False,
+        }
+    try:
+        owner = json.loads(raw) if raw.strip() else None
+    except json.JSONDecodeError:
+        owner = None
+    if not isinstance(owner, dict):
+        status = {"raw": raw, "owner": None, "legacy_format": False}
+        if time.time() - modified < EMPTY_LOCK_GRACE_SECONDS:
+            return {
+                **status,
+                "state": "busy",
+                "reason": "the lock is being created or has unrecognized contents",
+            }
+        return {
+            **status,
+            "state": "stale",
+            "ownerless": True,
+            "reason": "the lock has no recorded owner and is older than the "
+            "creation grace period",
+        }
+    status = {"raw": raw, "owner": owner, "legacy_format": "lock_id" not in owner}
+    host = owner.get("host")
+    pid = owner.get("pid")
+    if host is not None and host != socket.gethostname():
+        return {
+            **status,
+            "state": "unverifiable",
+            "reason": f"the lock belongs to host {host!r}",
+        }
+    if pid == os.getpid():
+        return {**status, "state": "live", "reason": "this process holds the lock"}
+    alive, started = _process_liveness(pid)
+    if alive is None:
+        return {
+            **status,
+            "state": "unverifiable",
+            "reason": f"could not determine whether process {pid!r} is running",
+        }
+    if not alive:
+        return {**status, "state": "stale", "reason": f"process {pid} is not running"}
+    if started is not None:
+        tolerance = timedelta(seconds=PROCESS_START_TOLERANCE_SECONDS)
+        recorded = _parse_timestamp(owner.get("process_started_at"))
+        created = _parse_timestamp(owner.get("created_at"))
+        if (recorded is not None and abs(started - recorded) > tolerance) or (
+            recorded is None and created is not None and started > created + tolerance
+        ):
+            return {
+                **status,
+                "state": "stale",
+                "reason": f"process ID {pid} now belongs to a different process",
+            }
+    return {**status, "state": "live", "reason": f"process {pid} is running"}
+
+
+def _lock_message(project, status, *, live):
+    owner = status.get("owner") or {}
+    details = ", ".join(
+        f"{key} {owner[key]}"
+        for key in ("pid", "host", "command", "created_at")
+        if owner.get(key) is not None
+    )
+    details = f"{details or 'owner unknown'}; {status.get('reason')}"
+    if live:
+        return (
+            f"Project {project!r} is already locked by a running writer ({details}). "
+            "Do not delete the lock; inspect it with "
+            f"`deep_think.py status --project {project}`."
+        )
+    return (
+        f"Project {project!r} is already locked by a writer that cannot be "
+        f"verified ({details}). After confirming that process has exited, run "
+        f"`deep_think.py reconcile --project {project} --release-lock`."
+    )
+
+
+def _retire_lock(lock_path, status):
+    retired = lock_path.with_name(f"{LOCK_FILENAME}.stale-{uuid.uuid4().hex}")
+    try:
+        os.rename(lock_path, retired)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ProjectLockedError(
+            f"Could not retire the stale project lock {lock_path}: {error}"
+        ) from error
+    try:
+        raw = retired.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raw = None
+    if raw != status.get("raw"):
+        try:
+            os.rename(retired, lock_path)
+        except OSError:
             pass
+        raise ProjectLockedError(
+            "The project lock changed while a stale lock was being recovered; "
+            "retry the command."
+        )
+    # Keep the retired lock until its evidence has been journaled.
+    return retired
+
+
+@contextmanager
+def _project_lock(root, project, *, command="ask", release_unverifiable=False):
+    project_dir = Path(root) / project
+    try:
+        project_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise DeepThinkError(
+            f"Could not create project directory {project_dir}: {error}"
+        ) from error
+    lock_path = project_dir / LOCK_FILENAME
+    owner = {
+        "schema": LOCK_SCHEMA,
+        "lock_id": uuid.uuid4().hex,
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "process_started_at": _current_process_started_at(),
+        "created_at": _utc_now(),
+        "command": command,
+    }
+    recovered = None
+    for _ in range(5):
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            status = _inspect_lock(lock_path)
+            if status["state"] == "none":
+                continue
+            if status["state"] in {"live", "busy"}:
+                raise ProjectLockedError(_lock_message(project, status, live=True))
+            if status["state"] == "unverifiable" and not release_unverifiable:
+                raise ProjectLockedError(_lock_message(project, status, live=False))
+            retired = _retire_lock(lock_path, status)
+            if retired is not None:
+                recovered = {**status, "retired_path": str(retired)}
+            continue
+        try:
+            os.write(descriptor, json.dumps(owner).encode("utf-8"))
+            os.fsync(descriptor)
+        except OSError as error:
+            os.close(descriptor)
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            raise DeepThinkError(
+                f"Could not record the project lock owner: {error}"
+            ) from error
+        os.close(descriptor)
+        break
+    else:
+        raise ProjectLockedError(
+            f"Project {project!r} is already locked: the lock changed repeatedly "
+            "while it was being acquired."
+        )
+    try:
+        yield WriterLock(lock_path, owner, recovered)
+    finally:
+        current = _inspect_lock(lock_path).get("owner") or {}
+        if current.get("lock_id") == owner["lock_id"]:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _parse_lock_owner(raw):
+    try:
+        owner = json.loads(raw) if raw and raw.strip() else None
+    except json.JSONDecodeError:
+        return None
+    return owner if isinstance(owner, dict) else None
+
+
+def _retired_locks(project_dir):
+    """Yield (path, raw contents or None if unreadable) for retired locks."""
+    for path in sorted(Path(project_dir).glob(f"{LOCK_FILENAME}.stale-*")):
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError):
+            raw = None
+        yield path, raw
+
+
+def _record_retired_lock(journal, raw, reason):
+    owner = _parse_lock_owner(raw)
+    legacy = owner is not None and "lock_id" not in owner
+    journal.append(
+        "stale_lock_recovered",
+        previous_owner=owner
+        if owner is not None
+        else {"raw": (raw or "")[:200], "unreadable": raw is None},
+        reason=reason,
+        legacy_format=legacy,
+    )
+    if owner is not None and owner.get("lock_id"):
+        for attempt in journal.view().attempts.values():
+            if attempt["lock_id"] == owner["lock_id"] and attempt["outcome"] is None:
+                journal.append(
+                    "submission_unknown",
+                    attempt_id=attempt["attempt_id"],
+                    turn_id=attempt["turn_id"],
+                    reason="the writer stopped after recording the submission "
+                    "intent and before recording its outcome",
+                )
+    elif legacy or raw is None:
+        journal.append(
+            "legacy_writer_unknown",
+            item_id=uuid.uuid4().hex,
+            previous_owner=owner,
+            reason="a writer without a request journal stopped; whether it left "
+            "an Azure request running is unknown",
+        )
+
+
+def _open_project_journal(project_dir, lock):
+    journal = RequestJournal(project_dir, lock_id=lock.lock_id)
+    recovered = lock.recovered or {}
+    for path, raw in _retired_locks(project_dir):
+        reason = (
+            recovered.get("reason")
+            if recovered.get("retired_path") == str(path)
+            else "left behind by an interrupted stale-lock recovery"
+        )
+        _record_retired_lock(journal, raw, reason)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return journal
 
 
 def _split_text_by_utf8_bytes(text, max_bytes):
@@ -1488,6 +2786,7 @@ def _request_visible_transcript_summary(
     on_retry,
     poll_timeout=DEFAULT_POLL_TIMEOUT,
     input_limit=MAX_INPUT_TOKENS,
+    journal=None,
 ):
     total_retry_count = 0
     intermediate_tokens = 0
@@ -1543,6 +2842,7 @@ def _request_visible_transcript_summary(
                 random_value=random_value,
                 on_retry=on_retry,
                 poll_timeout=poll_timeout,
+                journal=journal,
             )
             total_retry_count += chunk_outcome.retry_count
             intermediate_tokens += _response_usage(chunk_outcome.response)[
@@ -1590,6 +2890,7 @@ def _request_visible_transcript_summary(
         random_value=random_value,
         on_retry=on_retry,
         poll_timeout=poll_timeout,
+        journal=journal,
     )
     return RequestOutcome(
         final_outcome.response,
@@ -1622,6 +2923,7 @@ def _rollover_volume(
     poll_timeout=DEFAULT_POLL_TIMEOUT,
     recover_service_errors=False,
     service_recovery=False,
+    journal=None,
 ):
     summary_input_upper_bound = state["context_tokens"] + _estimate_tokens(
         ROLLOVER_SUMMARY_PROMPT
@@ -1656,6 +2958,7 @@ def _rollover_volume(
             input_limit=(
                 VISIBLE_SUMMARY_CHUNK_BYTES if service_recovery else MAX_INPUT_TOKENS
             ),
+            journal=journal,
         )
         recovery_note = "visible transcript recovery"
     elif summary_input_upper_bound > MAX_INPUT_TOKENS:
@@ -1679,6 +2982,7 @@ def _rollover_volume(
             random_value=random_value,
             on_retry=on_retry,
             poll_timeout=poll_timeout,
+            journal=journal,
         )
         recovery_note = "visible transcript recovery"
     else:
@@ -1706,6 +3010,7 @@ def _rollover_volume(
                 random_value=random_value,
                 on_retry=on_retry,
                 poll_timeout=poll_timeout,
+                journal=journal,
             )
         except (ContextLimitError, OpaqueReplayError, TerminalServiceError) as error:
             service_recovery = isinstance(error, TerminalServiceError)
@@ -1741,6 +3046,7 @@ def _rollover_volume(
                         if service_recovery
                         else MAX_INPUT_TOKENS
                     ),
+                    journal=journal,
                 )
             except ContextLimitError as recovery_error:
                 raise DeepThinkError(
@@ -1807,6 +3113,116 @@ def _rollover_volume(
     )
 
 
+def _begin_journaled_turn(
+    journal,
+    *,
+    project,
+    prompt,
+    deployment,
+    title,
+    rollover_tokens,
+    recover_service_errors,
+    state_sha256,
+    committed_response_id,
+    resume_turn_id,
+):
+    view = journal.view()
+    unknown = [a for a in view.attempts.values() if view.attempt_state(a) == "unknown"]
+    if unknown:
+        attempt = unknown[-1]
+        raise SubmissionUnknownError(
+            _submission_unknown_message(
+                attempt["purpose"] or "request",
+                RouteTarget(attempt["deployment"], None, attempt["resource"]),
+                attempt["attempt_id"],
+                attempt["reason"] or "the writer stopped before recording the outcome",
+            )
+        )
+    if view.unresolved_legacy():
+        raise RemoteStateError(
+            f"A pre-journal writer for project {project!r} stopped without "
+            "recording whether it left an Azure request running. Verify with "
+            "Azure telemetry, then run `reconcile --response-id ID --endpoint URL`, "
+            "or `reconcile --confirm-no-remote-job --reason TEXT` after confirming "
+            "that no job remains active."
+        )
+    prompt_sha256 = _sha256_text(prompt)
+    turn = view.open_turn()
+    if turn is not None:
+        attempts = view.turn_attempts(turn["turn_id"])
+        if committed_response_id is not None and any(
+            attempt["response_id"] == committed_response_id
+            and attempt["terminal_status"] == "completed"
+            for attempt in attempts
+        ):
+            journal.append(
+                "turn_committed",
+                turn_id=turn["turn_id"],
+                reason="the committed state already contains this turn's answer",
+            )
+            journal.release_turn_artifacts(turn["turn_id"])
+            turn = None
+    if turn is not None:
+        matches = (
+            turn["prompt_sha256"] == prompt_sha256
+            and turn["deployment"] == deployment
+            and state_sha256 in [turn["base_state_sha256"], *turn["checkpoints"]]
+        )
+        if matches and resume_turn_id in {None, turn["turn_id"]}:
+            journal.turn_id = turn["turn_id"]
+            journal.append("turn_resumed", state_sha256=state_sha256)
+            # The kind of checkpoint resumed from, or None at the turn's start.
+            return turn["checkpoint_kinds"].get(state_sha256)
+        outstanding = [
+            attempt
+            for attempt in attempts
+            if view.attempt_state(attempt) in OUTSTANDING_ATTEMPT_STATES
+        ]
+        recoverable = view.recoverable(turn["turn_id"])
+        if outstanding or recoverable or resume_turn_id is not None:
+            kind = "running" if outstanding else "completed but uncommitted"
+            ids = ", ".join(
+                attempt["response_id"] or attempt["attempt_id"]
+                for attempt in outstanding + recoverable
+            )
+            prefix = (
+                "The unfinished turn cannot be resumed because the committed "
+                "project state changed after it started. "
+                if resume_turn_id is not None
+                else ""
+            )
+            detail = f" with {kind} request(s) {ids}" if ids else ""
+            raise RemoteStateError(
+                f"{prefix}Project {project!r} has an unfinished turn{detail}. "
+                "Run `resume` to finish it, `cancel` to stop running jobs, or "
+                "`reconcile --abandon-turn --reason TEXT` to discard it."
+            )
+        journal.append(
+            "turn_superseded",
+            turn_id=turn["turn_id"],
+            reason="a different turn started; no running or uncommitted requests "
+            "remained",
+        )
+    elif resume_turn_id is not None:
+        raise DeepThinkError(
+            f"Project {project!r} has no unfinished turn; nothing to resume."
+        )
+    journal.turn_id = uuid.uuid4().hex
+    prompt_file = journal.save_prompt(journal.turn_id, prompt)
+    journal.append(
+        "turn_started",
+        project=project,
+        prompt_sha256=prompt_sha256,
+        prompt_file=prompt_file,
+        base_state_sha256=state_sha256,
+        deployment=deployment,
+        title=title,
+        rollover_tokens=rollover_tokens,
+        recover_service_errors=recover_service_errors,
+    )
+    return None
+
+
 def _run_turn_locked(
     client,
     *,
@@ -1814,6 +3230,7 @@ def _run_turn_locked(
     project,
     prompt,
     deployment,
+    journal,
     title=None,
     rollover_tokens=DEFAULT_ROLLOVER_TOKENS,
     max_attempts=DEFAULT_MAX_ATTEMPTS,
@@ -1824,6 +3241,7 @@ def _run_turn_locked(
     on_retry=None,
     poll_timeout=DEFAULT_POLL_TIMEOUT,
     recover_service_errors=False,
+    resume_turn_id=None,
 ):
     _validate_project(project)
     if not prompt.strip():
@@ -1842,6 +3260,7 @@ def _run_turn_locked(
     project_dir = Path(root) / project
     state_path = project_dir / "state.json"
     existing_project = state_path.exists()
+    state_sha256 = _file_sha256(state_path) if existing_project else None
     if existing_project:
         state = _read_json(state_path)
         _validate_state(state, project)
@@ -1893,16 +3312,60 @@ def _run_turn_locked(
             state.get("transcript_sha256"),
             "transcript",
         )
-        if deployment != state["deployment"]:
-            transcript += (
-                f"\nPrimary deployment upgraded from `{state['deployment']}` "
-                f"to `{deployment}`; preceding context retained.\n"
-            )
-            state["deployment"] = deployment
+    resumed_checkpoint = _begin_journaled_turn(
+        journal,
+        project=project,
+        prompt=prompt,
+        deployment=deployment,
+        title=title,
+        rollover_tokens=rollover_tokens,
+        recover_service_errors=recover_service_errors,
+        state_sha256=state_sha256,
+        committed_response_id=state.get("last_response_id"),
+        resume_turn_id=resume_turn_id,
+    )
+    if existing_project and deployment != state["deployment"]:
+        transcript += (
+            f"\nPrimary deployment upgraded from `{state['deployment']}` "
+            f"to `{deployment}`; preceding context retained.\n"
+        )
+        state["deployment"] = deployment
     pending_json = {}
     pending_text = {}
-    rolled_over = False
-    reactive_recovery_used = False
+    # Resuming from a checkpoint means this turn already produced the volume.
+    rolled_over = resumed_checkpoint is not None
+    # The single reactive recovery allowance persists through checkpoints.
+    reactive_recovery_used = resumed_checkpoint == "reactive"
+    checkpointed = False
+
+    def checkpoint(kind):
+        nonlocal checkpointed
+        _write_pending_state(
+            state_path,
+            state,
+            context_path=context_path,
+            transcript_path=transcript_path,
+            pending_json=pending_json,
+            pending_text=pending_text,
+        )
+        journal.append(
+            "turn_checkpoint", state_sha256=_file_sha256(state_path), kind=kind
+        )
+        journal.release_payloads(journal.turn_id)
+        checkpointed = True
+
+    def budget_after_rollover(kind):
+        # A completed rollover is paid work; keep it even if the prompt fails.
+        try:
+            return _normal_output_budget(
+                state["context_tokens"],
+                prompt,
+                state["rollover_tokens"],
+            )
+        except DeepThinkError:
+            if not checkpointed:
+                checkpoint(kind)
+            raise
 
     minimum_response_tokens = _minimum_response_tokens(state["rollover_tokens"])
     input_upper_bound = state["context_tokens"] + _estimate_tokens(prompt)
@@ -1916,6 +3379,24 @@ def _run_turn_locked(
         )
     )
     if history and output_budget < minimum_response_tokens:
+        minimum_carried_tokens = (
+            _estimate_message_tokens("developer", "")
+            + _estimate_tokens(f"{CARRIED_CONTEXT_PREFIX.rstrip()}\n\n")
+            + 1
+        )
+        try:
+            best_case_budget = _normal_output_budget(
+                minimum_carried_tokens, prompt, state["rollover_tokens"]
+            )
+        except DeepThinkError:
+            best_case_budget = -1
+        if best_case_budget < minimum_response_tokens or resumed_checkpoint:
+            # A rollover cannot make room, or this turn already rolled over:
+            # do not pay for another summary.
+            raise DeepThinkError(
+                "Prompt leaves too little room for reasoning and output even "
+                "after a rollover; split it into smaller turns."
+            )
         (
             context_path,
             transcript_path,
@@ -1941,24 +3422,16 @@ def _run_turn_locked(
             on_retry=on_retry,
             poll_timeout=poll_timeout,
             recover_service_errors=recover_service_errors,
+            journal=journal,
         )
         rolled_over = True
         if recover_service_errors:
-            _write_pending_state(
-                state_path,
-                state,
-                context_path=context_path,
-                transcript_path=transcript_path,
-                pending_json=pending_json,
-                pending_text=pending_text,
-            )
-        output_budget = _normal_output_budget(
-            state["context_tokens"],
-            prompt,
-            state["rollover_tokens"],
-        )
+            checkpoint("proactive")
+        output_budget = budget_after_rollover("proactive")
 
     if output_budget < minimum_response_tokens:
+        if pending_json and not checkpointed:
+            checkpoint("proactive")
         raise DeepThinkError(
             "Prompt leaves too little room for reasoning and output; split it "
             "into a smaller first turn."
@@ -1986,6 +3459,7 @@ def _run_turn_locked(
             random_value=random_value,
             on_retry=on_retry,
             poll_timeout=poll_timeout,
+            journal=journal,
         )
     except (
         ContextLimitError,
@@ -2073,69 +3547,55 @@ def _run_turn_locked(
                     else None
                 )
             ),
+            journal=journal,
         )
         rolled_over = True
         reactive_recovery_used = True
         recovery_count = 1
         if recover_service_errors:
-            _write_pending_state(
-                state_path,
-                state,
-                context_path=context_path,
-                transcript_path=transcript_path,
-                pending_json=pending_json,
-                pending_text=pending_text,
-            )
-        output_budget = _normal_output_budget(
-            state["context_tokens"],
-            prompt,
-            state["rollover_tokens"],
-        )
+            checkpoint("reactive")
+        output_budget = budget_after_rollover("reactive")
         if (
             isinstance(error, OutputLimitError)
             and output_budget <= exhausted_output_budget
         ):
-            _write_pending_state(
-                state_path,
-                state,
-                context_path=context_path,
-                transcript_path=transcript_path,
-                pending_json=pending_json,
-                pending_text=pending_text,
-            )
+            if not checkpointed:
+                checkpoint("reactive")
             raise DeepThinkError(
                 "Fresh rollover output budget is not larger than the exhausted "
                 "answer budget; split or narrow the request and continue from "
                 "the new volume."
             ) from error
         if output_budget < minimum_response_tokens:
-            _write_pending_state(
-                state_path,
-                state,
-                context_path=context_path,
-                transcript_path=transcript_path,
-                pending_json=pending_json,
-                pending_text=pending_text,
-            )
+            if not checkpointed:
+                checkpoint("reactive")
             raise DeepThinkError(
                 "Prompt remains too large after context rollover."
             ) from error
-        outcome = request_response(
-            client,
-            build_response_request(
-                [*history, user_item],
-                deployment,
-                output_budget,
-            ),
-            purpose="answer after rollover",
-            max_attempts=max_attempts,
-            base_delay=retry_base_delay,
-            max_delay=retry_max_delay,
-            sleep=sleep,
-            random_value=random_value,
-            on_retry=on_retry,
-            poll_timeout=poll_timeout,
-        )
+        try:
+            outcome = request_response(
+                client,
+                build_response_request(
+                    [*history, user_item],
+                    deployment,
+                    output_budget,
+                ),
+                purpose="answer after rollover",
+                max_attempts=max_attempts,
+                base_delay=retry_base_delay,
+                max_delay=retry_max_delay,
+                sleep=sleep,
+                random_value=random_value,
+                on_retry=on_retry,
+                poll_timeout=poll_timeout,
+                journal=journal,
+            )
+        except (OutputLimitError, ContextLimitError, OpaqueReplayError):
+            # Retrying cannot change this outcome, so keep the paid rollover
+            # and let the caller narrow the request from the new volume.
+            if not checkpointed:
+                checkpoint("reactive")
+            raise
     response = outcome.response
     _require_complete(response)
 
@@ -2166,6 +3626,14 @@ def _run_turn_locked(
         pending_json=pending_json,
         pending_text=pending_text,
     )
+    journal.append_best_effort(
+        "turn_committed",
+        state_sha256=_file_sha256(state_path),
+        volume=state["volume"],
+        turn=state["turn"],
+        response_id=response.id,
+    )
+    journal.release_turn_artifacts(journal.turn_id)
 
     return TurnResult(
         response.output_text,
@@ -2173,6 +3641,17 @@ def _run_turn_locked(
         rolled_over,
         transcript_path,
     )
+
+
+def _run_journaled_turn(client, journal, **options):
+    try:
+        return _run_turn_locked(client, journal=journal, **options)
+    except BaseException as error:
+        if journal.turn_id is not None:
+            journal.append_best_effort(
+                "turn_error", error=f"{type(error).__name__}: {error}"
+            )
+        raise
 
 
 def run_turn(
@@ -2194,9 +3673,11 @@ def run_turn(
     recover_service_errors=False,
 ):
     _validate_project(project)
-    with _project_lock(root, project):
-        return _run_turn_locked(
+    with _project_lock(root, project, command="ask") as lock:
+        journal = _open_project_journal(Path(root) / project, lock)
+        return _run_journaled_turn(
             client,
+            journal,
             root=root,
             project=project,
             prompt=prompt,
@@ -2214,6 +3695,637 @@ def run_turn(
         )
 
 
+def _existing_project_dir(root, project):
+    _validate_project(project)
+    project_dir = Path(root) / project
+    if not project_dir.is_dir():
+        raise DeepThinkError(f"Project directory not found: {project_dir}")
+    return project_dir
+
+
+def resume_turn(
+    client_builder,
+    *,
+    root,
+    project,
+    max_attempts=DEFAULT_MAX_ATTEMPTS,
+    retry_base_delay=DEFAULT_RETRY_BASE_DELAY,
+    retry_max_delay=DEFAULT_RETRY_MAX_DELAY,
+    sleep=time.sleep,
+    random_value=random.random,
+    on_retry=None,
+    poll_timeout=DEFAULT_POLL_TIMEOUT,
+):
+    """Finish the journaled unfinished turn without duplicating known requests."""
+    project_dir = _existing_project_dir(root, project)
+    with _project_lock(root, project, command="resume") as lock:
+        journal = _open_project_journal(project_dir, lock)
+        turn = journal.view().open_turn()
+        if turn is None:
+            raise DeepThinkError(
+                f"Project {project!r} has no unfinished turn; nothing to resume."
+            )
+        prompt = journal.read_prompt(turn)
+        return _run_journaled_turn(
+            client_builder(turn["deployment"]),
+            journal,
+            root=root,
+            project=project,
+            prompt=prompt,
+            deployment=turn["deployment"],
+            title=turn["title"],
+            rollover_tokens=turn["rollover_tokens"],
+            max_attempts=max_attempts,
+            retry_base_delay=retry_base_delay,
+            retry_max_delay=retry_max_delay,
+            sleep=sleep,
+            random_value=random_value,
+            on_retry=on_retry,
+            poll_timeout=poll_timeout,
+            recover_service_errors=bool(turn["recover_service_errors"]),
+            resume_turn_id=turn["turn_id"],
+        )
+
+
+def _attempt_summary(attempt, state):
+    return {
+        "attempt_id": attempt["attempt_id"],
+        "turn_id": attempt["turn_id"],
+        "state": state,
+        "purpose": attempt["purpose"],
+        "response_id": attempt["response_id"],
+        "deployment": attempt["deployment"],
+        "resource": attempt["resource"],
+        "role": attempt["role"],
+        "target": f"{attempt['target_index']}/{attempt['target_count']}",
+        "submitted_at": attempt["submitted_at"],
+        "last_status": attempt["last_status"],
+        "poll_stopped": attempt["poll_stopped"],
+        "reason": attempt["reason"],
+        "request_sha256": attempt["request_sha256"],
+        "request_bytes": attempt["request_bytes"],
+        "max_output_tokens": attempt["max_output_tokens"],
+    }
+
+
+def _committed_summary(project_dir):
+    state_path = project_dir / "state.json"
+    if not state_path.exists():
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return {"error": str(error)}
+    if not isinstance(state, dict):
+        return {"error": "state.json is not a JSON object"}
+    return {
+        "volume": state.get("volume"),
+        "turn": state.get("turn"),
+        "deployment": state.get("deployment"),
+        "last_response_id": state.get("last_response_id"),
+        "state_file_sha256": _file_sha256(state_path),
+    }
+
+
+def _next_steps(project, lock, outstanding, unresolved, recoverable):
+    command = "deep_think.py"
+    steps = []
+    if lock["state"] in {"live", "busy"}:
+        steps.append(
+            f"A writer holds the project ({lock.get('reason')}). Wait for it to "
+            "finish; do not delete the lock."
+        )
+    if lock["state"] == "unverifiable":
+        steps.append(
+            "After confirming the lock owner has exited, run "
+            f"`{command} reconcile --project {project} --release-lock`."
+        )
+    active = [item["response_id"] for item in outstanding if item["state"] == "active"]
+    if active:
+        steps.append(
+            f"Run `{command} resume --project {project}` to keep polling "
+            f"{', '.join(active)} on the original resource without resubmitting, "
+            f"or `{command} cancel --project {project}` to stop it. "
+            f"`{command} reconcile --project {project}` records current remote status."
+        )
+    if recoverable:
+        steps.append(
+            f"Run `{command} resume --project {project}` to commit the cached "
+            "completed response without a new request."
+        )
+    if unresolved or any(item["state"] == "unknown" for item in outstanding):
+        steps.append(
+            "Azure may have accepted a request whose response ID was never "
+            "recorded. Search Azure telemetry using the recorded time, deployment, "
+            "resource, and request SHA-256."
+        )
+        steps.append(
+            f"If found, run `{command} reconcile --project {project} --attempt "
+            "ATTEMPT --response-id ID` (for a pre-journal writer: `--response-id ID "
+            "--endpoint URL`). If you verify that no job remains active, run "
+            f"`{command} reconcile --project {project} --confirm-no-remote-job "
+            "--reason TEXT`."
+        )
+    return steps or ["No recovery action is required."]
+
+
+def project_status(root, project):
+    """Return read-only local and journaled remote request state."""
+    project_dir = _existing_project_dir(root, project)
+    lock = _inspect_lock(project_dir / LOCK_FILENAME)
+    journal_path = project_dir / JOURNAL_DIRECTORY / JOURNAL_FILENAME
+    records, torn_tail = _read_journal(journal_path)
+    view = JournalView(records, torn_tail=torn_tail)
+    owner = lock.get("owner") or {}
+    live_lock_id = owner.get("lock_id") if lock["state"] in {"live", "busy"} else None
+    outstanding = [
+        _attempt_summary(attempt, view.attempt_state(attempt, live_lock_id))
+        for attempt in view.outstanding(live_lock_id)
+    ]
+    unresolved = [
+        {
+            "item_id": item["item_id"],
+            "recorded_at": item["recorded_at"],
+            "previous_owner": item["previous_owner"],
+        }
+        for item in view.unresolved_legacy()
+    ]
+    if (
+        lock["state"] in {"stale", "unverifiable"}
+        and lock.get("legacy_format")
+        and lock.get("owner") is not None
+    ):
+        unresolved.append(
+            {
+                "item_id": None,
+                "recorded_at": None,
+                "previous_owner": lock["owner"],
+                "note": "pre-journal lock; it is recorded as unresolved when a "
+                "writer recovers it",
+            }
+        )
+    for _path, raw in _retired_locks(project_dir):
+        owner = _parse_lock_owner(raw)
+        if raw is None or (owner is not None and "lock_id" not in owner):
+            unresolved.append(
+                {
+                    "item_id": None,
+                    "recorded_at": None,
+                    "previous_owner": owner,
+                    "note": "retired pre-journal lock awaiting its journal record",
+                }
+            )
+    turn = view.open_turn()
+    recoverable = [
+        _attempt_summary(attempt, view.attempt_state(attempt, live_lock_id))
+        for attempt in (view.recoverable(turn["turn_id"]) if turn else [])
+    ]
+    blocking = []
+    if lock["state"] in {"live", "busy", "unverifiable"}:
+        blocking.append(f"writer lock is {lock['state']}: {lock.get('reason')}")
+    blocking.extend(
+        f"{item['state']} request {item['response_id'] or item['attempt_id']}"
+        for item in outstanding
+    )
+    if unresolved:
+        blocking.append("a pre-journal writer may have left an Azure request running")
+    if recoverable:
+        blocking.append("the unfinished turn has completed but uncommitted responses")
+    return {
+        "project": project,
+        "project_dir": str(project_dir),
+        "writer_lock": {
+            "state": lock["state"],
+            "reason": lock.get("reason"),
+            "owner": lock.get("owner"),
+            "legacy_format": bool(lock.get("legacy_format")),
+        },
+        "committed": _committed_summary(project_dir),
+        "journal": {
+            "path": str(journal_path),
+            "records": len(records),
+            "torn_tail": torn_tail,
+        },
+        "open_turn": (
+            {
+                key: turn[key]
+                for key in (
+                    "turn_id",
+                    "started_at",
+                    "deployment",
+                    "prompt_sha256",
+                    "base_state_sha256",
+                    "last_error",
+                )
+            }
+            if turn
+            else None
+        ),
+        "outstanding": outstanding,
+        "unresolved_unknown": unresolved,
+        "recoverable": recoverable,
+        "can_submit_new_request": not blocking,
+        "blocking": blocking,
+        "next_steps": _next_steps(project, lock, outstanding, unresolved, recoverable),
+    }
+
+
+def _api_errors():
+    try:
+        from openai import APIConnectionError, APIStatusError
+    except ImportError as error:
+        raise DeepThinkError(
+            "Install dependencies with: "
+            "python -m pip install --upgrade openai azure-identity"
+        ) from error
+    return APIConnectionError, APIStatusError
+
+
+def _remote_call(client_factory, clients, resource, operation, response_id):
+    """Run one retrieve/cancel call; return (kind, response or message)."""
+    connection_error, status_error = _api_errors()
+    try:
+        if resource not in clients:
+            clients[resource] = client_factory(resource)
+        response = getattr(clients[resource].responses, operation)(response_id)
+    except status_error as error:
+        status_code, _code, message = _status_error_details(error)
+        if status_code == 404:
+            return "not_found", f"Azure HTTP 404: {message}"
+        return "error", f"Azure HTTP {status_code}: {message}"
+    except connection_error as error:
+        return "error", f"{type(error).__name__}: {error}"
+    except Exception as error:
+        # The SDK fetches Entra tokens before its transport error handling.
+        if _is_credential_error(error):
+            raise DeepThinkError(
+                f"Azure authentication failed while calling {operation} for "
+                f"{response_id}: {error} Fix authentication (for example, "
+                "`az login`) and retry; no remote state was changed by this call."
+            ) from error
+        raise
+    return "response", response
+
+
+def cancel_requests(client_factory, *, root, project, response_ids=(), endpoint=None):
+    """Cancel journaled (or explicitly identified) background responses."""
+    project_dir = _existing_project_dir(root, project)
+    results = []
+    with _project_lock(root, project, command="cancel") as lock:
+        journal = _open_project_journal(project_dir, lock)
+        view = journal.view()
+        if response_ids:
+            plan = []
+            for response_id in response_ids:
+                attempt = view.attempt_for_response(response_id)
+                if attempt is None and not endpoint:
+                    raise DeepThinkError(
+                        f"Response {response_id} is not in the request journal; "
+                        "pass --endpoint with its original resource."
+                    )
+                resource = attempt["resource"] if attempt else endpoint
+                plan.append((response_id, resource, attempt))
+        else:
+            plan = [
+                (attempt["response_id"], attempt["resource"], attempt)
+                for attempt in view.outstanding()
+                if view.attempt_state(attempt) == "active"
+            ]
+        clients = {}
+        for response_id, resource, attempt in plan:
+            attempt_fields = (
+                {"attempt_id": attempt["attempt_id"], "turn_id": attempt["turn_id"]}
+                if attempt
+                else {}
+            )
+            kind, value = _remote_call(
+                client_factory, clients, resource, "cancel", response_id
+            )
+            if kind == "error" and attempt is not None:
+                # Azure rejects cancelling finished jobs (HTTP 400), so record
+                # the job's actual state instead of leaving it marked active.
+                observed_kind, observed = _remote_call(
+                    client_factory, clients, resource, "retrieve", response_id
+                )
+                if observed_kind == "response":
+                    status, note = _record_observed_response(journal, attempt, observed)
+                    results.append(
+                        {
+                            "response_id": response_id,
+                            "status": status,
+                            "resource": resource,
+                            "note": f"cancel failed ({value}); {note}",
+                        }
+                    )
+                    continue
+                if observed_kind == "not_found":
+                    kind, value = observed_kind, observed
+            if kind != "response":
+                if kind == "not_found" and attempt is not None:
+                    value = _record_not_found(journal, attempt, response_id)
+                results.append(
+                    {"response_id": response_id, "status": None, "error": value}
+                )
+                continue
+            status = _safe_response_status(value)
+            journal.append(
+                "cancel_requested",
+                response_id=response_id,
+                resource=resource,
+                status=status,
+                **attempt_fields,
+            )
+            results.append(
+                {"response_id": response_id, "status": status, "resource": resource}
+            )
+    if not results:
+        results_message = "No active journaled responses to cancel."
+    else:
+        results_message = f"Processed {len(results)} cancellation request(s)."
+    return {
+        "message": results_message,
+        "results": results,
+        "status": project_status(root, project),
+    }
+
+
+def _record_not_found(journal, attempt, response_id):
+    fields = {
+        "attempt_id": attempt["attempt_id"],
+        "turn_id": attempt["turn_id"],
+        "response_id": response_id,
+    }
+    if attempt["attached_unverified"]:
+        journal.append(
+            "attachment_rejected",
+            reason="the operator-attached response ID was not found on the "
+            "attempt's recorded resource",
+            **fields,
+        )
+        return (
+            f"{response_id}: not found on the attempt's recorded resource; the "
+            "submission remains unknown"
+        )
+    journal.append("remote_unavailable", http_status=404, **fields)
+    return (
+        f"{response_id}: no longer retained by Azure (HTTP 404) on its original "
+        "resource; treated as not running"
+    )
+
+
+def _record_observed_response(journal, attempt, response):
+    """Record a retrieved response for a journaled attempt; return (status, note)."""
+    status = _safe_response_status(response)
+    fields = {"attempt_id": attempt["attempt_id"], "turn_id": attempt["turn_id"]}
+    if status not in TERMINAL_RESPONSE_STATUSES:
+        journal.append("poll_status", status=status, **fields)
+        return status, f"still {status}"
+    journal.record_terminal(attempt["attempt_id"], response)
+    if status == "completed":
+        try:
+            if _response_text(response).strip():
+                journal.save_completion(attempt["attempt_id"], response)
+                return status, "completed; cached for `resume`"
+        except (DeepThinkError, MalformedResponseError) as error:
+            return status, f"completed but not cached ({error})"
+    return status, status
+
+
+def _refresh_active_attempts(journal, client_factory, clients, actions):
+    view = journal.view()
+    for attempt in view.attempts.values():
+        if view.attempt_state(attempt) != "active":
+            continue
+        response_id = attempt["response_id"]
+        kind, value = _remote_call(
+            client_factory, clients, attempt["resource"], "retrieve", response_id
+        )
+        if kind == "not_found":
+            actions.append(_record_not_found(journal, attempt, response_id))
+        elif kind == "error":
+            actions.append(f"{response_id}: could not observe status ({value})")
+        else:
+            _status, note = _record_observed_response(journal, attempt, value)
+            actions.append(f"{response_id}: {note}")
+
+
+def reconcile_project(
+    client_factory,
+    *,
+    root,
+    project,
+    response_id=None,
+    endpoint=None,
+    attempt_id=None,
+    confirm_no_remote_job=False,
+    abandon_turn=False,
+    reason=None,
+    release_lock=False,
+):
+    """Record observed remote state and explicit operator resolutions."""
+    reason = reason.strip() if isinstance(reason, str) else None
+    if (confirm_no_remote_job or abandon_turn) and not reason:
+        raise DeepThinkError(
+            "--confirm-no-remote-job and --abandon-turn require --reason "
+            "describing the evidence."
+        )
+    if attempt_id and not (response_id or confirm_no_remote_job):
+        raise DeepThinkError(
+            "--attempt requires --response-id or --confirm-no-remote-job."
+        )
+    project_dir = _existing_project_dir(root, project)
+    actions = []
+    clients = {}
+    with _project_lock(
+        root, project, command="reconcile", release_unverifiable=release_lock
+    ) as lock:
+        journal = _open_project_journal(project_dir, lock)
+        if lock.recovered is not None:
+            actions.append(f"recovered writer lock ({lock.recovered.get('reason')})")
+        if response_id:
+            view = journal.view()
+            if attempt_id:
+                attempt = view.attempts.get(attempt_id)
+                if attempt is None or view.attempt_state(attempt) != "unknown":
+                    raise DeepThinkError(
+                        f"Attempt {attempt_id} is not an unresolved unknown "
+                        "submission in the request journal."
+                    )
+                if (
+                    endpoint
+                    and attempt["resource"] is not None
+                    and endpoint != attempt["resource"]
+                ):
+                    raise DeepThinkError(
+                        f"Attempt {attempt_id} was submitted to its recorded resource "
+                        f"{attempt['resource']!r}; --endpoint cannot override it."
+                    )
+                journal.append(
+                    "operator_attached",
+                    attempt_id=attempt_id,
+                    turn_id=attempt["turn_id"],
+                    response_id=response_id,
+                    resource=endpoint or attempt["resource"],
+                    reason=reason,
+                    operator=_operator_name(),
+                )
+                actions.append(f"attached {response_id} to attempt {attempt_id}")
+            elif view.attempt_for_response(response_id) is None:
+                if not endpoint:
+                    raise DeepThinkError(
+                        "--endpoint is required for a response ID that is not in "
+                        "the request journal."
+                    )
+                kind, value = _remote_call(
+                    client_factory, clients, endpoint, "retrieve", response_id
+                )
+                status = _safe_response_status(value) if kind == "response" else None
+                journal.append(
+                    "external_response_observed",
+                    response_id=response_id,
+                    resource=endpoint,
+                    status=status,
+                    result=kind,
+                )
+                legacy = journal.view().unresolved_legacy()
+                if status in TERMINAL_RESPONSE_STATUSES and legacy:
+                    journal.append(
+                        "legacy_resolved",
+                        item_ids=[item["item_id"] for item in legacy],
+                        response_id=response_id,
+                        observed_status=status,
+                        reason=reason,
+                        operator=_operator_name(),
+                    )
+                    actions.append(
+                        f"{response_id} is {status}; resolved the pre-journal writer"
+                    )
+                elif status in ACTIVE_RESPONSE_STATUSES:
+                    actions.append(
+                        f"{response_id} is still {status}; wait, or stop it with "
+                        f"`cancel --response-id {response_id} --endpoint URL`"
+                    )
+                elif kind == "not_found":
+                    actions.append(
+                        f"{response_id} was not found on that resource; this does "
+                        "not prove that no request is running"
+                    )
+                else:
+                    actions.append(f"{response_id}: {status or value}")
+        _refresh_active_attempts(journal, client_factory, clients, actions)
+        view = journal.view()
+        if confirm_no_remote_job:
+            attempts = [
+                attempt["attempt_id"]
+                for attempt in view.attempts.values()
+                if view.attempt_state(attempt) == "unknown"
+                and attempt_id in {None, attempt["attempt_id"]}
+            ]
+            items = [item["item_id"] for item in view.unresolved_legacy()]
+            if attempts or items:
+                journal.append(
+                    "operator_confirmed_no_remote_job",
+                    attempt_ids=attempts,
+                    item_ids=items,
+                    reason=reason,
+                    operator=_operator_name(),
+                )
+                actions.append(
+                    f"confirmed no remote job for {len(attempts) + len(items)} "
+                    "unknown submission(s)"
+                )
+            else:
+                actions.append("no unresolved unknown submissions to confirm")
+            view = journal.view()
+        if abandon_turn:
+            turn = view.open_turn()
+            if turn is None:
+                actions.append("no unfinished turn to abandon")
+            else:
+                running = [
+                    attempt["response_id"] or attempt["attempt_id"]
+                    for attempt in view.turn_attempts(turn["turn_id"])
+                    if view.attempt_state(attempt) in OUTSTANDING_ATTEMPT_STATES
+                ]
+                if running:
+                    raise RemoteStateError(
+                        "Cannot abandon the unfinished turn while request(s) "
+                        f"{', '.join(running)} may still be running; cancel them "
+                        "or resolve unknown submissions first."
+                    )
+                journal.append(
+                    "turn_abandoned",
+                    turn_id=turn["turn_id"],
+                    reason=reason,
+                    operator=_operator_name(),
+                )
+                journal.release_turn_artifacts(turn["turn_id"])
+                actions.append(f"abandoned unfinished turn {turn['turn_id']}")
+    return {"actions": actions, "status": project_status(root, project)}
+
+
+def _add_project_arguments(parser):
+    parser.add_argument("--project", required=True)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(
+            os.getenv(
+                "DEEP_THINK_TRANSCRIPTS_ROOT",
+                "deep-think-transcripts",
+            )
+        ),
+    )
+
+
+def _add_routing_arguments(parser):
+    parser.add_argument(
+        "--endpoint",
+        help=(
+            "Primary v1 endpoint or preview Responses URL. Defaults to "
+            "AZURE_OPENAI_GPT6_ENDPOINT, then AZURE_OPENAI_ENDPOINT."
+        ),
+    )
+    parser.add_argument(
+        "--backup-endpoint",
+        help="Backup resource for the primary model; defaults to AZURE_OPENAI_GPT6_BACKUP_ENDPOINT for GPT-6.",
+    )
+    parser.add_argument(
+        "--backup-deployment",
+        help="Backup deployment name if different from the primary deployment.",
+    )
+    parser.add_argument(
+        "--fallback-endpoint",
+        default=os.getenv("AZURE_OPENAI_FALLBACK_ENDPOINT")
+        or os.getenv("AZURE_OPENAI_ENDPOINT"),
+        help="Resource hosting the existing GPT-5.6 and GPT-5.4 deployments.",
+    )
+
+
+def _add_retry_arguments(parser):
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_MAX_ATTEMPTS,
+    )
+    parser.add_argument(
+        "--poll-timeout",
+        type=float,
+        default=DEFAULT_POLL_TIMEOUT,
+        help="Polling budget in seconds per accepted job (default: 3600); never resubmit on expiry.",
+    )
+    parser.add_argument(
+        "--retry-base-delay",
+        type=float,
+        default=DEFAULT_RETRY_BASE_DELAY,
+    )
+    parser.add_argument(
+        "--retry-max-delay",
+        type=float,
+        default=DEFAULT_RETRY_MAX_DELAY,
+    )
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(
         description=(
@@ -2226,42 +4338,12 @@ def _build_parser():
         "ask",
         help="Add one turn to a locally persisted research project.",
     )
-    ask.add_argument("--project", required=True)
+    _add_project_arguments(ask)
     ask.add_argument("--title")
     prompt_group = ask.add_mutually_exclusive_group()
     prompt_group.add_argument("--prompt")
     prompt_group.add_argument("--prompt-file", type=Path)
-    ask.add_argument(
-        "--root",
-        type=Path,
-        default=Path(
-            os.getenv(
-                "DEEP_THINK_TRANSCRIPTS_ROOT",
-                "deep-think-transcripts",
-            )
-        ),
-    )
-    ask.add_argument(
-        "--endpoint",
-        help=(
-            "Primary v1 endpoint or preview Responses URL. Defaults to "
-            "AZURE_OPENAI_GPT6_ENDPOINT, then AZURE_OPENAI_ENDPOINT."
-        ),
-    )
-    ask.add_argument(
-        "--backup-endpoint",
-        help="Backup resource for the primary model; defaults to AZURE_OPENAI_GPT6_BACKUP_ENDPOINT for GPT-6.",
-    )
-    ask.add_argument(
-        "--backup-deployment",
-        help="Backup deployment name if different from the primary deployment.",
-    )
-    ask.add_argument(
-        "--fallback-endpoint",
-        default=os.getenv("AZURE_OPENAI_FALLBACK_ENDPOINT")
-        or os.getenv("AZURE_OPENAI_ENDPOINT"),
-        help="Resource hosting the existing GPT-5.6 and GPT-5.4 deployments.",
-    )
+    _add_routing_arguments(ask)
     ask.add_argument(
         "--deployment",
         default=os.getenv("AZURE_OPENAI_DEPLOYMENT", DEFAULT_DEPLOYMENT),
@@ -2271,31 +4353,67 @@ def _build_parser():
         type=int,
         default=DEFAULT_ROLLOVER_TOKENS,
     )
-    ask.add_argument(
-        "--max-attempts",
-        type=int,
-        default=DEFAULT_MAX_ATTEMPTS,
-    )
-    ask.add_argument(
-        "--poll-timeout",
-        type=float,
-        default=DEFAULT_POLL_TIMEOUT,
-        help="Polling budget in seconds per accepted job (default: 3600); never resubmit on expiry.",
-    )
+    _add_retry_arguments(ask)
     ask.add_argument(
         "--recover-service-errors",
         action="store_true",
         help="Allow one visible-transcript rollover after terminal server_error retries exhaust.",
     )
-    ask.add_argument(
-        "--retry-base-delay",
-        type=float,
-        default=DEFAULT_RETRY_BASE_DELAY,
+
+    status = subparsers.add_parser(
+        "status",
+        help="Show the writer lock and journaled request state (read-only).",
     )
-    ask.add_argument(
-        "--retry-max-delay",
-        type=float,
-        default=DEFAULT_RETRY_MAX_DELAY,
+    _add_project_arguments(status)
+
+    resume = subparsers.add_parser(
+        "resume",
+        help="Finish the unfinished turn, polling known jobs on their original resources.",
+    )
+    _add_project_arguments(resume)
+    _add_routing_arguments(resume)
+    _add_retry_arguments(resume)
+
+    cancel = subparsers.add_parser(
+        "cancel",
+        help="Cancel active background responses on their original resources.",
+    )
+    _add_project_arguments(cancel)
+    cancel.add_argument("--response-id", action="append", dest="response_ids")
+    cancel.add_argument(
+        "--endpoint",
+        help="Original resource for a response ID that is not in the journal.",
+    )
+
+    reconcile = subparsers.add_parser(
+        "reconcile",
+        help="Record observed remote state and explicit recovery decisions.",
+    )
+    _add_project_arguments(reconcile)
+    reconcile.add_argument("--response-id")
+    reconcile.add_argument(
+        "--endpoint",
+        help="Original resource for a response ID found outside the journal.",
+    )
+    reconcile.add_argument(
+        "--attempt",
+        help="Unknown submission attempt that --response-id belongs to.",
+    )
+    reconcile.add_argument(
+        "--confirm-no-remote-job",
+        action="store_true",
+        help="Record that unknown submissions created no running job (needs --reason).",
+    )
+    reconcile.add_argument(
+        "--abandon-turn",
+        action="store_true",
+        help="Discard the unfinished turn once no remote work is outstanding.",
+    )
+    reconcile.add_argument("--reason")
+    reconcile.add_argument(
+        "--release-lock",
+        action="store_true",
+        help="Break a writer lock whose owner cannot be verified.",
     )
     return parser
 
@@ -2313,6 +4431,35 @@ def _prompt_from_args(args, stdin):
     return stdin.read()
 
 
+def _router_from_args(args, deployment, client_factory):
+    legacy_deployment = deployment in DEFAULT_FALLBACK_DEPLOYMENTS
+    endpoint = (
+        args.endpoint
+        or (
+            args.fallback_endpoint
+            if legacy_deployment
+            else os.getenv("AZURE_OPENAI_GPT6_ENDPOINT")
+        )
+        or os.getenv("AZURE_OPENAI_ENDPOINT")
+    )
+    backup_endpoint = args.backup_endpoint or (
+        None if legacy_deployment else os.getenv("AZURE_OPENAI_GPT6_BACKUP_ENDPOINT")
+    )
+    return create_routed_client(
+        endpoint,
+        deployment,
+        backup_endpoint=backup_endpoint,
+        backup_deployment=args.backup_deployment
+        or (
+            None
+            if legacy_deployment
+            else os.getenv("AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT")
+        ),
+        fallback_endpoint=args.fallback_endpoint,
+        client_factory=client_factory,
+    )
+
+
 def main(
     argv=None,
     *,
@@ -2328,63 +4475,79 @@ def main(
         stdout.reconfigure(encoding="utf-8")
     args = _build_parser().parse_args(argv)
 
+    def report_retry(event):
+        stderr.write(
+            f"Retrying {event.purpose} after {event.reason} "
+            f"(attempt {event.attempt}/{event.max_attempts}, "
+            f"delay {event.delay:.2f}s).\n"
+        )
+
     try:
-        prompt = _prompt_from_args(args, stdin)
-        legacy_deployment = args.deployment in DEFAULT_FALLBACK_DEPLOYMENTS
-        endpoint = (
-            args.endpoint
-            or (
-                args.fallback_endpoint
-                if legacy_deployment
-                else os.getenv("AZURE_OPENAI_GPT6_ENDPOINT")
+        if args.command == "status":
+            report = project_status(args.root, args.project)
+        elif args.command == "cancel":
+            report = cancel_requests(
+                client_factory,
+                root=args.root,
+                project=args.project,
+                response_ids=args.response_ids or (),
+                endpoint=args.endpoint,
             )
-            or os.getenv("AZURE_OPENAI_ENDPOINT")
-        )
-        backup_endpoint = args.backup_endpoint or (
-            None
-            if legacy_deployment
-            else os.getenv("AZURE_OPENAI_GPT6_BACKUP_ENDPOINT")
-        )
-        client = create_routed_client(
-            endpoint,
-            args.deployment,
-            backup_endpoint=backup_endpoint,
-            backup_deployment=args.backup_deployment
-            or (
-                None
-                if legacy_deployment
-                else os.getenv("AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT")
-            ),
-            fallback_endpoint=args.fallback_endpoint,
-            client_factory=client_factory,
-        )
-
-        def report_retry(event):
-            stderr.write(
-                f"Retrying {event.purpose} after {event.reason} "
-                f"(attempt {event.attempt}/{event.max_attempts}, "
-                f"delay {event.delay:.2f}s).\n"
+        elif args.command == "reconcile":
+            report = reconcile_project(
+                client_factory,
+                root=args.root,
+                project=args.project,
+                response_id=args.response_id,
+                endpoint=args.endpoint,
+                attempt_id=args.attempt,
+                confirm_no_remote_job=args.confirm_no_remote_job,
+                abandon_turn=args.abandon_turn,
+                reason=args.reason,
+                release_lock=args.release_lock,
             )
-
-        result = run_turn(
-            client,
-            root=args.root,
-            project=args.project,
-            title=args.title,
-            prompt=prompt,
-            deployment=args.deployment,
-            rollover_tokens=args.rollover_tokens,
-            max_attempts=args.max_attempts,
-            retry_base_delay=args.retry_base_delay,
-            retry_max_delay=args.retry_max_delay,
-            on_retry=report_retry,
-            poll_timeout=args.poll_timeout,
-            recover_service_errors=args.recover_service_errors,
-        )
+        elif args.command == "resume":
+            report = None
+            result = resume_turn(
+                lambda deployment: _router_from_args(args, deployment, client_factory),
+                root=args.root,
+                project=args.project,
+                max_attempts=args.max_attempts,
+                retry_base_delay=args.retry_base_delay,
+                retry_max_delay=args.retry_max_delay,
+                on_retry=report_retry,
+                poll_timeout=args.poll_timeout,
+            )
+        else:
+            report = None
+            prompt = _prompt_from_args(args, stdin)
+            result = run_turn(
+                _router_from_args(args, args.deployment, client_factory),
+                root=args.root,
+                project=args.project,
+                title=args.title,
+                prompt=prompt,
+                deployment=args.deployment,
+                rollover_tokens=args.rollover_tokens,
+                max_attempts=args.max_attempts,
+                retry_base_delay=args.retry_base_delay,
+                retry_max_delay=args.retry_max_delay,
+                on_retry=report_retry,
+                poll_timeout=args.poll_timeout,
+                recover_service_errors=args.recover_service_errors,
+            )
     except DeepThinkError as error:
         stderr.write(f"deep-think: {error}\n")
+        if args.command in {"ask", "resume"}:
+            stderr.write(
+                "deep-think: inspect recovery state with "
+                f"`deep_think.py status --project {args.project}`.\n"
+            )
         return 2
 
+    if report is not None:
+        stdout.write(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+        return 0
     stdout.write(result.text.rstrip() + "\n")
     stderr.write(f"Transcript: {result.transcript_path}\n")
     return 0

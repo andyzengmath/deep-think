@@ -141,6 +141,23 @@ def make_validation_error():
 
 
 class RequestConfigurationTests(unittest.TestCase):
+    def test_default_credential_allows_slow_azure_cli_token_commands(self):
+        deep_think = load_module()
+        captured = {}
+
+        class FakeCredential:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        with mock.patch("azure.identity.DefaultAzureCredential", FakeCredential):
+            deep_think.create_client(
+                "https://example.invalid/openai/v1/",
+                token_provider_factory=lambda *_args: lambda: "test-token",
+                openai_factory=lambda **_kwargs: object(),
+            )
+
+        self.assertEqual(captured, {"process_timeout": 60})
+
     def test_default_model_and_attempt_budget_cover_gpt6_chain(self):
         deep_think = load_module()
         with mock.patch.dict("os.environ", {}, clear=True):
@@ -424,6 +441,11 @@ class CrossEndpointFailoverTests(unittest.TestCase):
         import openai
 
         deep_think = load_module()
+        request = httpx.Request("POST", "https://test")
+        refused = openai.APIConnectionError(request=request)
+        refused.__cause__ = httpx.ConnectError("refused", request=request)
+        connect_timeout = openai.APITimeoutError(request=request)
+        connect_timeout.__cause__ = httpx.ConnectTimeout("timeout", request=request)
         malformed = FakeResponse("resp-malformed", "Bad.")
         malformed.usage = None
         failures = [
@@ -431,9 +453,8 @@ class CrossEndpointFailoverTests(unittest.TestCase):
             make_status_error(409, "conflict"),
             make_status_error(500, "server_error"),
             make_status_error(404, "DeploymentNotFound"),
-            openai.APIConnectionError(request=httpx.Request("POST", "https://test")),
-            openai.APITimeoutError(request=httpx.Request("POST", "https://test")),
-            make_validation_error(),
+            refused,
+            connect_timeout,
             malformed,
             FakeResponse("resp-empty", ""),
             FakeResponse(
@@ -816,25 +837,24 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(outcome.deployment, "gpt-5.6-sol")
         self.assertEqual(outcome.retry_count, 1)
 
-    def test_malformed_azure_response_is_retried(self):
+    def test_malformed_creation_without_id_is_not_resubmitted(self):
         deep_think = load_module()
         malformed = make_validation_error()
-        complete = FakeResponse("resp-complete", "Complete proof.")
+        complete = FakeResponse("resp-complete", "Must not be requested.")
         client = FakeClient([malformed, complete])
 
-        outcome = deep_think.request_response(
-            client,
-            {"model": "gpt-5.6-sol", "input": "Prove it."},
-            purpose="answer",
-            max_attempts=2,
-            base_delay=0,
-            sleep=lambda _delay: None,
-            random_value=lambda: 0,
-        )
+        with self.assertRaisesRegex(deep_think.SubmissionUnknownError, "unknown"):
+            deep_think.request_response(
+                client,
+                {"model": "gpt-5.6-sol", "input": "Prove it."},
+                purpose="answer",
+                max_attempts=2,
+                base_delay=0,
+                sleep=lambda _delay: None,
+                random_value=lambda: 0,
+            )
 
-        self.assertIs(outcome.response, complete)
-        self.assertEqual(outcome.retry_count, 1)
-        self.assertEqual(len(client.responses.calls), 2)
+        self.assertEqual(len(client.responses.calls), 1)
 
     def test_partial_completed_response_is_retried_as_malformed(self):
         deep_think = load_module()
