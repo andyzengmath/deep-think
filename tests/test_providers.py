@@ -175,8 +175,16 @@ class MethodSelectionTests(unittest.TestCase):
         cases = [
             ({}, [], ("entra",)),
             (azure, [], ("entra",)),
-            ({**azure, "AZURE_OPENAI_API_KEY": "k"}, [], ("azure-key",)),
-            ({**azure, "AZURE_OPENAI_GPT6_API_KEY": "k"}, [], ("azure-key",)),
+            (
+                {**azure, "AZURE_OPENAI_API_KEY": "k"},
+                [],
+                ("azure-key", "entra"),
+            ),
+            (
+                {**azure, "AZURE_OPENAI_GPT6_API_KEY": "k"},
+                [],
+                ("azure-key", "entra"),
+            ),
             (
                 {**azure, "AZURE_OPENAI_API_KEY": "k"},
                 ["--auth", "entra"],
@@ -796,6 +804,323 @@ class CrossProviderRecoveryTests(ProjectFixture):
             {result["status"] for result in json.loads(stdout)["results"]},
             {"cancelled"},
         )
+
+
+class NotFoundClient:
+    """Fake SDK client whose jobs are invisible (HTTP 404) to this credential."""
+
+    def __init__(self, resource, log):
+        def call(operation, response_id):
+            log.append((resource, operation, response_id))
+            raise make_status_error(404, "not_found", message="No response found.")
+
+        self.responses = SimpleNamespace(
+            retrieve=lambda response_id, **_options: call("retrieve", response_id),
+            cancel=lambda response_id: call("cancel", response_id),
+        )
+
+
+class ReviewRegressionTests(ProjectFixture):
+    """Regressions for issues found while reviewing the multi-provider change."""
+
+    def cli(self, *arguments, factory=None, log=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = self.runner.main(
+            [arguments[0], "--project", self.project, "--root", str(self.root)]
+            + list(arguments[1:]),
+            client_factory=factory or (lambda resource: LoggingClient(resource, log)),
+            stdout=stdout,
+            stderr=stderr,
+        )
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def start_job(self, provider, resource):
+        router = self.runner.create_routed_client(
+            resource,
+            "gpt-6-astra",
+            provider=provider,
+            client_factory=lambda _resource: FakeClient(
+                [FakeResponse("resp-job", "", status="queued", incomplete_reason=None)],
+                [make_status_error(401, "unauthorized")],
+            ),
+        )
+        with self.assertRaisesRegex(self.runner.DeepThinkError, "resp-job"):
+            self.ask(router)
+
+    def parse(self, command, *extra):
+        return self.runner._build_parser().parse_args(
+            [command, "--project", "p", *extra]
+        )
+
+    def test_endpoints_configured_for_the_other_provider_are_never_trusted(self):
+        gateway = "https://gateway.example/openai/v1/"
+        environment = {
+            "AZURE_OPENAI_GPT6_ENDPOINT": gateway,
+            "OPENAI_API_KEY": "sk",
+            "OPENAI_BASE_URL": PROXY_V1,
+        }
+        seen = []
+        with mock.patch.dict("os.environ", environment, clear=True):
+            azure = self.runner._trusted_client_factory(
+                seen.append, self.parse("cancel", "--endpoint", PROXY_V1), "azure"
+            )
+            with self.assertRaisesRegex(
+                self.runner.DeepThinkError, "--auth openai-key"
+            ):
+                azure(PROXY_V1)
+            openai_trusted = self.runner._trusted_client_factory(
+                seen.append,
+                self.parse("cancel", "--auth", "openai-key", "--endpoint", gateway),
+                "openai",
+            )
+            with self.assertRaisesRegex(self.runner.DeepThinkError, "--auth entra"):
+                openai_trusted(gateway)
+        self.assertEqual(seen, [])
+
+    def test_azure_endpoints_shared_with_openai_tools_stay_usable(self):
+        # Some tools point OPENAI_BASE_URL at an Azure v1 endpoint.
+        environment = {
+            "AZURE_OPENAI_GPT6_ENDPOINT": AZURE_V1,
+            "OPENAI_BASE_URL": AZURE_V1,
+        }
+        seen = []
+        with mock.patch.dict("os.environ", environment, clear=True):
+            factory = self.runner._trusted_client_factory(
+                seen.append, self.parse("cancel"), "azure"
+            )
+            factory(AZURE_V1)
+        self.assertEqual(seen, [AZURE_V1])
+
+    def test_endpoint_option_requires_a_single_provider(self):
+        self.seed()
+        log = []
+        environment = {
+            "AZURE_OPENAI_GPT6_ENDPOINT": AZURE_V1,
+            "OPENAI_API_KEY": "sk",
+            "DEEP_THINK_AUTH": "entra,openai-key",
+        }
+        with mock.patch.dict("os.environ", environment, clear=True):
+            code, _stdout, stderr = self.cli(
+                "cancel", "--response-id", "resp-x", "--endpoint", PROXY_V1, log=log
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("--endpoint", stderr)
+        self.assertIn("single provider", stderr)
+        self.assertEqual(log, [])
+
+    def test_openai_not_found_keeps_the_job_blocking_until_confirmed(self):
+        self.seed()
+        self.start_job("openai", PROXY_V1)
+        log = []
+        environment = {"OPENAI_API_KEY": "sk", "OPENAI_BASE_URL": PROXY_V1}
+        with mock.patch.dict("os.environ", environment, clear=True):
+            code, stdout, stderr = self.cli(
+                "cancel",
+                factory=lambda resource: NotFoundClient(resource, log),
+            )
+        self.assertEqual(code, 0, stderr)
+        [result] = json.loads(stdout)["results"]
+        self.assertIn("unknown", result["error"])
+        status = self.status()
+        self.assertFalse(status["can_submit_new_request"])
+        self.assertEqual([item["state"] for item in status["outstanding"]], ["unknown"])
+        with mock.patch.dict("os.environ", environment, clear=True):
+            code, _stdout, stderr = self.cli(
+                "reconcile",
+                "--confirm-no-remote-job",
+                "--reason",
+                "Verified in the OpenAI dashboard.",
+                log=log,
+            )
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(self.status()["can_submit_new_request"])
+
+    def test_azure_not_found_still_means_the_job_is_gone(self):
+        self.seed()
+        self.start_job("azure", AZURE_V1)
+        log = []
+        with mock.patch.dict(
+            "os.environ", {"AZURE_OPENAI_GPT6_ENDPOINT": AZURE_V1}, clear=True
+        ):
+            code, _stdout, stderr = self.cli(
+                "cancel", factory=lambda resource: NotFoundClient(resource, log)
+            )
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(self.status()["can_submit_new_request"])
+
+    def test_custom_fallback_projects_still_upgrade_to_gpt6(self):
+        self.runner.run_turn(
+            FakeClient([FakeResponse("resp-old", "Old answer.")]),
+            root=self.root,
+            project=self.project,
+            prompt="First.",
+            deployment="gpt-5.6-sol-alt",
+            sleep=lambda _delay: None,
+        )
+        with self.assertRaisesRegex(self.runner.DeepThinkError, "already"):
+            self.ask(FakeClient([FakeResponse("resp-new", "New answer.")]))
+        result = self.runner.run_turn(
+            FakeClient([FakeResponse("resp-new", "New answer.")]),
+            root=self.root,
+            project=self.project,
+            prompt="Second.",
+            deployment="gpt-6-astra",
+            upgradable_deployments=("gpt-5.6-sol", "gpt-5.6-sol-alt"),
+            sleep=lambda _delay: None,
+        )
+        self.assertEqual(result.text, "New answer.")
+        self.assertEqual(self.state()["deployment"], "gpt-6-astra")
+        environment = {
+            "AZURE_OPENAI_FALLBACK_DEPLOYMENTS": "gpt-5.6-sol-alt,gpt-5.4-pro",
+            "OPENAI_FALLBACK_MODELS": "gpt-5.4-pro",
+        }
+        with mock.patch.dict("os.environ", environment, clear=True):
+            self.assertEqual(
+                self.runner._upgradable_deployments(),
+                ("gpt-5.6-sol", "gpt-5.4-pro", "gpt-5.6-sol-alt"),
+            )
+
+    def test_openai_model_not_found_moves_down_the_chain(self):
+        client = FakeClient(
+            [
+                make_status_error(404, "model_not_found"),
+                FakeResponse("resp-ok", "Fallback answer."),
+            ]
+        )
+        outcome = self.runner.request_response(
+            client,
+            {"model": "gpt-6-astra", "input": "Q."},
+            purpose="answer",
+            sleep=lambda _delay: None,
+        )
+        self.assertEqual(outcome.deployment, "gpt-5.6-sol")
+
+    def test_gpt54_named_deployments_get_the_gpt54_profile(self):
+        request = {
+            "model": "gpt-6-astra",
+            "reasoning": {"mode": "pro", "effort": "max", "context": "all_turns"},
+        }
+        routed = self.runner._request_for_deployment(request, "gpt-5.4-pro-eu")
+        self.assertEqual(routed["reasoning"], {"effort": "xhigh"})
+        self.assertEqual(
+            self.runner._reasoning_profile("gpt-5.4-pro-eu"),
+            ("not configurable", "xhigh"),
+        )
+
+    def test_backup_methods_without_credentials_are_skipped_per_resource(self):
+        legacy = "https://legacy.openai.azure.com/openai/v1/"
+        environment = {
+            "AZURE_OPENAI_GPT6_ENDPOINT": AZURE_V1,
+            "AZURE_OPENAI_GPT6_API_KEY": "gpt6-key",
+            "AZURE_OPENAI_FALLBACK_ENDPOINT": legacy,
+        }
+        with mock.patch.dict("os.environ", environment, clear=True):
+            factory = self.runner._configured_client_factories(("entra", "azure-key"))[
+                "azure"
+            ]
+            self.assertIsInstance(factory(AZURE_V1), self.runner.AuthFallbackClient)
+            self.assertNotIsInstance(factory(legacy), self.runner.AuthFallbackClient)
+            only_keys = self.runner._configured_client_factories(("azure-key",))
+            with self.assertRaises(self.runner.MissingCredentialError):
+                only_keys["azure"](legacy)
+
+    def test_signed_out_providers_are_skipped_after_wrapping_around(self):
+        target = self.runner.RouteTarget
+        azure = FakeClient([make_status_error(401, "unauthorized")])
+        first = FakeClient(
+            [
+                make_status_error(429, "rate_limit_exceeded"),
+                FakeResponse("resp-ok", "Answer."),
+            ]
+        )
+        second = FakeClient([make_status_error(429, "rate_limit_exceeded")])
+        router = self.runner.DeploymentRouter(
+            [
+                target("gpt-6-astra", azure, AZURE_V1, "primary", "azure"),
+                target("gpt-6-astra", first, OPENAI_V1, "primary", "openai"),
+                target("gpt-5.4-pro", second, OPENAI_V1, "fallback", "openai"),
+            ]
+        )
+        outcome = self.runner.request_response(
+            router,
+            {"model": "gpt-6-astra", "input": "Q."},
+            purpose="answer",
+            max_attempts=4,
+            base_delay=0,
+            sleep=lambda _delay: None,
+            random_value=lambda: 0,
+        )
+        self.assertEqual(outcome.response.id, "resp-ok")
+        self.assertEqual(len(azure.responses.calls), 1)
+
+    def test_tampered_provider_values_fail_closed(self):
+        view = self.runner.JournalView(
+            [{"event": "submitting", "attempt_id": "a", "provider": ["azure"]}]
+        )
+        attempt = view.attempts["a"]
+        self.assertEqual(
+            self.runner._attempt_summary(attempt, "active")["provider"], "invalid"
+        )
+        self.assertIn(
+            "journal", self.runner._provider_mismatch(attempt, ("azure", "openai"))
+        )
+
+    def test_azure_clients_do_not_send_openai_account_headers(self):
+        requests = []
+        environment = {"OPENAI_ORG_ID": "org-test", "OPENAI_PROJECT_ID": "proj-test"}
+        with mock.patch.dict("os.environ", environment, clear=True):
+            azure = self.runner.create_client(
+                AZURE_PREVIEW,
+                auth="azure-key",
+                api_key="azure-test-key",
+                openai_factory=recording_sdk(requests, completed_body()),
+            )
+            openai_client = self.runner.create_client(
+                None,
+                auth="openai-key",
+                api_key="sk-test",
+                openai_factory=recording_sdk(requests, completed_body()),
+            )
+        azure.responses.create(model="gpt-6-astra", input="Q.")
+        openai_client.responses.create(model="gpt-6-astra", input="Q.")
+        azure_request, openai_request = requests
+        self.assertNotIn("openai-organization", azure_request.headers)
+        self.assertNotIn("openai-project", azure_request.headers)
+        self.assertEqual(openai_request.headers["openai-organization"], "org-test")
+
+    def test_primary_model_may_not_be_listed_as_an_azure_fallback(self):
+        environment = {
+            "AZURE_OPENAI_GPT6_ENDPOINT": AZURE_V1,
+            "AZURE_OPENAI_FALLBACK_DEPLOYMENTS": "gpt-6-astra,gpt-5.4-pro",
+        }
+        with (
+            mock.patch.dict("os.environ", environment, clear=True),
+            self.assertRaisesRegex(
+                self.runner.DeepThinkError, "AZURE_OPENAI_FALLBACK_DEPLOYMENTS"
+            ),
+        ):
+            self.runner._router_from_args(
+                self.parse("ask", "--prompt", "Q."),
+                "gpt-6-astra",
+                lambda _resource: object(),
+            )
+
+    def test_unparsable_hosts_are_refused(self):
+        with self.assertRaises(self.runner.DeepThinkError):
+            self.runner._refuse_cross_provider_host("azure", "https://[bad")
+
+    def test_journaled_errors_redact_api_key_fragments(self):
+        self.seed()
+        failure = make_status_error(
+            401,
+            "invalid_api_key",
+            message="Incorrect API key provided: sk-proj-****WXYZ. Check it.",
+        )
+        with self.assertRaises(self.runner.DeepThinkError):
+            self.ask(FakeClient([failure]))
+        journal = (self.project_dir / "requests" / "journal.jsonl").read_text("utf-8")
+        self.assertIn("turn_error", journal)
+        self.assertNotIn("WXYZ", journal)
 
 
 if __name__ == "__main__":

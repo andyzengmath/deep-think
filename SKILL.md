@@ -16,8 +16,8 @@ In the commands below, `<skill-dir>` means that folder (for example
 `~/.agents/skills/deep-think`, `~/.claude/skills/deep-think`, or a project's
 `.agents/skills/deep-think`); use `python3` where `python` is unavailable. Keep
 the working directory and transcript root in the research project. Model
-credentials come only from the shell environment; your agent's own login does
-not authenticate model requests.
+credentials come only from the environment and the user's private env file;
+your agent's own login does not authenticate model requests.
 
 1. Read [references/research-protocol.md](references/research-protocol.md) before
    starting or resuming an investigation.
@@ -80,14 +80,14 @@ to stderr.
 ## Retry and recover
 
 Use the defaults unless the environment requires a different bounded policy.
-By default each request gets one submission attempt per routed model, and at
-least five:
+By default each request gets one submission attempt per routed model, at least
+five and at most ten; pass `--max-attempts` only to set a fixed budget, since a
+small value can cut a backup chain short:
 
 ```powershell
 python "<skill-dir>/scripts/deep_think.py" ask `
   --project "project-slug" `
   --prompt "Continue the proof audit." `
-  --max-attempts 5 `
   --retry-base-delay 1 `
   --retry-max-delay 30
 ```
@@ -202,7 +202,10 @@ uncommitted requests block a different prompt until resolved. A pre-journal
 stale lock is recorded as an unresolved unknown submission. Never delete the
 lock or journal by hand. Background responses stored with `store=false` are
 retained only briefly after completion, so resume promptly; an HTTP 404 on the
-original resource is recorded as no longer running, and its output is lost. The
+original Azure resource is recorded as no longer running, and its output is
+lost. An OpenAI 404 cannot tell a deleted response from one hidden by a
+different project's key, so it becomes an unknown submission to resolve with
+`reconcile`. The
 journal contains prompts and resource endpoint names but no credentials; review
 it before committing, as with transcripts. Treat journals from other people as
 untrusted: the runner rejects artifact names that would leave `requests\` and
@@ -210,7 +213,8 @@ sends credentials only to endpoints configured for the job's provider. Each
 job records its provider; recover it with an `--auth` list that includes that
 provider (`status` shows `--auth openai-key` for OpenAI jobs). After changing
 endpoint configuration, pass an old recorded endpoint explicitly with
-`--endpoint` to resume, cancel, or reconcile its job.
+`--endpoint` and a single-provider `--auth` list to resume, cancel, or
+reconcile its job.
 
 ## Continue rigorously
 

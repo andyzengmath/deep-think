@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "deep_think.py"
+
+# Keep every test (and subprocess) independent of the developer's shell
+# settings and private env file.
+for _name in [
+    name
+    for name in os.environ
+    if name.startswith(("AZURE_OPENAI_", "OPENAI_", "DEEP_THINK_"))
+]:
+    del os.environ[_name]
+os.environ["DEEP_THINK_ENV_FILE"] = os.devnull
 
 
 def load_module():

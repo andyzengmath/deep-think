@@ -65,6 +65,13 @@ class EnvFileTests(unittest.TestCase):
                 self.assertNotIn("secret-value", str(raised.exception))
                 self.assertEqual(environ, {})
 
+    def test_errors_never_echo_secret_looking_names(self):
+        # A wrapped base64 key can look like NAME=value with the secret as NAME.
+        path = self.write("c2VjcmV0dmFsdWV0aGF0aXNsb25n==\n")
+        with self.assertRaisesRegex(self.runner.DeepThinkError, ":1") as raised:
+            self.runner.load_env_file(path, environ={})
+        self.assertNotIn("c2VjcmV0", str(raised.exception))
+
     def test_explicit_file_must_exist_and_the_default_file_is_optional(self):
         missing = self.directory / "missing.env"
         with self.assertRaisesRegex(self.runner.DeepThinkError, "DEEP_THINK_ENV_FILE"):

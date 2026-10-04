@@ -20,13 +20,15 @@ Use this reference when maintaining or debugging the runner.
   `gpt-5.6-sol`, then `gpt-5.4-pro`; `none` disables them).
 - API: Responses
 - Sign-in methods: `entra`, `azure-key`, and `openai-key`, ordered by `--auth`
-  or `DEEP_THINK_AUTH`; without either, one method is detected (Azure when an
-  Azure endpoint variable or endpoint option is set). OpenAI uses
-  `OPENAI_API_KEY`, optional `OPENAI_BASE_URL`, and the chain `gpt-6-astra`
-  then `OPENAI_FALLBACK_MODELS` (default `gpt-5.6-sol`, `gpt-5.4-pro`). Later
+  or `DEEP_THINK_AUTH`; without either, the methods are detected (Azure when an
+  Azure endpoint variable or endpoint option is set, as `azure-key,entra` when
+  an Azure key is set and `entra` otherwise). OpenAI uses `OPENAI_API_KEY`,
+  optional `OPENAI_BASE_URL`, and the chain `gpt-6-astra` then
+  `OPENAI_FALLBACK_MODELS` (default `gpt-5.6-sol`, `gpt-5.4-pro`). Later
   providers' chains follow earlier ones. Journal `submitting` records include
-  `provider` (absent means Azure); recovery refuses jobs whose provider is not
-  listed, and credentials are refused for the other provider's hosts.
+  `provider` (absent means Azure; other non-provider values are invalid);
+  recovery refuses jobs whose provider is not listed, and credentials are
+  refused for the other provider's hosts and configured endpoints.
 - Authentication: Azure Entra ID through
   `DefaultAzureCredential(process_timeout=60)` and
   `get_bearer_token_provider(..., "https://ai.azure.com/.default")`; the longer
@@ -70,7 +72,8 @@ By default, make one submission attempt per routed model, and at least five
   response leaves the retry loop.
 - Empty completed responses.
 - HTTP 408, 409, 429, and non-gateway 5xx responses.
-- Submission-level HTTP 404 with exact code `DeploymentNotFound`.
+- Submission-level HTTP 404 with exact code `DeploymentNotFound` (Azure) or
+  `model_not_found` (OpenAI).
 - Azure `server_error`, `too_many_requests`, `rate_limit_exceeded`,
   `no_capacity`, `timeout`, and `temporarily_unavailable` response codes.
 
@@ -120,10 +123,12 @@ headers. A response-object `server_error` is distinct from an HTTP 500.
 Honor `x-should-retry`, `Retry-After`, and `retry-after-ms`, except that HTTP
 429 remains retryable even if `x-should-retry` is `false` so deployment
 failover and same-ID polling recovery cannot be disabled. Otherwise use
-exponential backoff with bounded jitter. Never retry refusals, authentication
-or authorization failures, ordinary bad requests, or other permanent 4xx
-errors, even when `x-should-retry` is `true`. The exact submission-level
-`DeploymentNotFound` exception is target-specific and allows failover.
+exponential backoff with bounded jitter. Never retry refusals, ordinary bad
+requests, or other permanent 4xx errors, even when `x-should-retry` is `true`.
+Sign-in failures (a credential error, or HTTP 401/403) are not retried on the
+same method; they move to the next listed `--auth` method or provider, and are
+otherwise terminal. The exact submission-level `DeploymentNotFound` and
+`model_not_found` 404s are target-specific and allow failover.
 Persist only the final complete response.
 
 ## Context policy
@@ -215,10 +220,15 @@ Keep local writer state separate from remote request state:
   repository. Accept only the bare artifact names the runner writes
   (`<response-id>.json`, `<attempt-id>.response.json`, `<turn-id>.prompt.txt`)
   and require each resolved path to stay directly inside `requests/`; any other
-  name marks the journal as corrupt. The CLI sends Entra tokens only to
-  endpoints configured for the invocation (the GPT-6, backup, and fallback
-  endpoint variables, `AZURE_OPENAI_ENDPOINT`, or explicit endpoint options);
-  it refuses any other recorded resource.
+  name marks the journal as corrupt. The CLI sends credentials only to
+  endpoints configured for the job's provider: for Azure, the GPT-6, backup,
+  and fallback endpoint variables, `AZURE_OPENAI_ENDPOINT`, or explicit
+  endpoint options; for OpenAI, `OPENAI_BASE_URL` (default
+  `https://api.openai.com/v1/`) or an explicit `--endpoint` with a
+  single-provider `--auth` list. It refuses any other recorded resource and any
+  endpoint configured for the other provider. An OpenAI 404 makes the attempt
+  unknown (`remote_not_visible`) rather than finished, because OpenAI hides
+  responses from other projects.
 
 Each turn journals its prompt, deployment, and starting state digest. Re-running
 the identical prompt, or `resume`, continues that turn: a matching request

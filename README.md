@@ -85,8 +85,9 @@ Open the copied `.env` file and uncomment one option:
 | An OpenAI API key | `OPENAI_API_KEY` | The key itself |
 | An Azure OpenAI resource with `gpt-6-astra` deployed | `AZURE_OPENAI_ENDPOINT` | `az login` or a managed identity (Microsoft Entra ID), or `AZURE_OPENAI_API_KEY` |
 
-Variables already set in your shell take precedence, so CI systems and secret
-managers keep working. Never commit the filled-in file.
+Variables already set in your shell (with a non-empty value) take precedence,
+so CI systems and secret managers keep working. Never commit the filled-in
+file.
 
 ### 3. Ask
 
@@ -114,7 +115,8 @@ current folder.
 Deep Think detects one sign-in method automatically:
 
 1. If an Azure endpoint is configured, it uses the **Azure API key** when one
-   is set, and **Microsoft Entra ID** otherwise.
+   is set, with **Microsoft Entra ID** as its backup, and Entra ID alone
+   otherwise.
 2. If not, it uses the **OpenAI API key** when `OPENAI_API_KEY` is set.
 
 To choose a method explicitly or add backups, list methods in priority order
@@ -132,11 +134,12 @@ Each request then follows one ordered chain, just like the model backup plan:
 3. openai-key   gpt-6-astra → gpt-5.6-sol → gpt-5.4-pro on the OpenAI API
 ```
 
-- Rate limits, server errors, and missing deployments move a request to the
-  next model. After the last Azure model, the next provider in the list takes
-  over.
+- Rate limits, server errors, and missing deployments or models move a request
+  to the next model. After the last Azure model, the next provider in the list
+  takes over.
 - A failed sign-in (no Entra ID token, or HTTP 401/403) switches to the next
-  method immediately.
+  method immediately. A method without a credential for a resource, such as a
+  missing per-resource key, is skipped there.
 - Deep Think never sends a prompt to a provider you did not list.
 - Change the model fallbacks with `AZURE_OPENAI_FALLBACK_DEPLOYMENTS` and
   `OPENAI_FALLBACK_MODELS`; `none` disables them.
@@ -200,14 +203,16 @@ each bounded research episode and before a handoff.
 ## Privacy and security
 
 - Settings come only from your environment and your private env file:
-  `~/.config/deep-think/.env`, or the path in `DEEP_THINK_ENV_FILE`. Shell
-  variables win, and the file may set only `AZURE_*`, `OPENAI_*`, and
-  `DEEP_THINK_*` variables.
+  `~/.config/deep-think/.env` (`$XDG_CONFIG_HOME/deep-think/.env` when that is
+  set), or the path in `DEEP_THINK_ENV_FILE`. Non-empty shell variables win,
+  and the file may set only `AZURE_*`, `OPENAI_*`, and `DEEP_THINK_*`
+  variables.
 - Keys are never accepted as command-line arguments, logged, or written to
   transcripts or journals. Azure keys are sent only in the `api-key` header.
 - Credentials never cross providers. OpenAI keys are refused for Azure hosts,
-  Azure credentials are refused for OpenAI hosts, and each journaled job is
-  recovered only through the provider that accepted it.
+  Azure credentials are refused for OpenAI hosts and for any endpoint you
+  configured for OpenAI, and each journaled job is recovered only through the
+  provider that accepted it.
 - Transcripts and journals contain your prompts and answers. Review them
   before committing.
 
