@@ -128,6 +128,18 @@ CONFIGURED_ENDPOINT_VARIABLES = (
     "AZURE_OPENAI_FALLBACK_ENDPOINT",
     "AZURE_OPENAI_ENDPOINT",
 )
+# Resource-specific Azure keys; AZURE_OPENAI_API_KEY covers any other resource.
+AZURE_KEY_VARIABLES = {
+    "AZURE_OPENAI_GPT6_ENDPOINT": "AZURE_OPENAI_GPT6_API_KEY",
+    "AZURE_OPENAI_GPT6_BACKUP_ENDPOINT": "AZURE_OPENAI_GPT6_BACKUP_API_KEY",
+    "AZURE_OPENAI_FALLBACK_ENDPOINT": "AZURE_OPENAI_FALLBACK_API_KEY",
+}
+OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1/"
+DEFAULT_OPENAI_FALLBACK_MODELS = ("gpt-5.6-sol", "gpt-5.4-pro")
+# Hosts that identify a provider; one provider's credentials never go to the other.
+AZURE_HOST_SUFFIXES = (".azure.com", ".azure.us", ".azure.cn")
+OPENAI_HOST = "openai.com"
+ENDPOINT_OPTIONS = ("endpoint", "backup_endpoint", "fallback_endpoint")
 
 
 class DeepThinkError(RuntimeError):
@@ -493,12 +505,10 @@ def _retry_event(purpose, attempt, max_attempts, reason, delay, on_retry):
         on_retry(event)
 
 
-def _deployment_chain(primary_deployment):
-    if primary_deployment in DEFAULT_FALLBACK_DEPLOYMENTS:
-        return DEFAULT_FALLBACK_DEPLOYMENTS[
-            DEFAULT_FALLBACK_DEPLOYMENTS.index(primary_deployment) :
-        ]
-    return (primary_deployment, *DEFAULT_FALLBACK_DEPLOYMENTS)
+def _deployment_chain(primary_deployment, fallbacks=DEFAULT_FALLBACK_DEPLOYMENTS):
+    if primary_deployment in fallbacks:
+        return tuple(fallbacks[fallbacks.index(primary_deployment) :])
+    return (primary_deployment, *fallbacks)
 
 
 def _request_for_deployment(request, deployment):
@@ -516,13 +526,86 @@ def _request_for_deployment(request, deployment):
     return routed_request
 
 
+def _validate_openai_endpoint(endpoint):
+    endpoint = (endpoint or OPENAI_DEFAULT_BASE_URL).strip()
+    parsed = urlsplit(endpoint)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise DeepThinkError(
+            "OpenAI base URL must use HTTPS, include a host, and contain no "
+            "credentials, query parameters, or fragments."
+        )
+    return endpoint.rstrip("/") + "/"
+
+
+def _refuse_cross_provider_host(provider, endpoint):
+    """Never send one provider's credentials to the other provider's host."""
+    try:
+        host = (urlsplit(endpoint.strip()).hostname or "").rstrip(".")
+    except (AttributeError, ValueError):
+        return
+    if provider == "openai" and host.endswith(AZURE_HOST_SUFFIXES):
+        raise DeepThinkError(
+            f"Refusing to send OpenAI credentials to Azure host {host}. "
+            "Use --provider azure for Azure OpenAI endpoints."
+        )
+    if provider == "azure" and (
+        host == OPENAI_HOST or host.endswith("." + OPENAI_HOST)
+    ):
+        raise DeepThinkError(
+            f"Refusing to send Azure credentials to OpenAI host {host}. "
+            "Use --provider openai for the OpenAI API."
+        )
+
+
+def _import_openai():
+    try:
+        from openai import OpenAI
+    except ImportError as error:
+        raise DeepThinkError(
+            "Install dependencies with: python -m pip install --upgrade openai"
+        ) from error
+    return OpenAI
+
+
 def create_client(
     endpoint,
     *,
+    auth="entra",
+    api_key=None,
     credential_factory=None,
     token_provider_factory=None,
     openai_factory=None,
 ):
+    """Create a Responses client.
+
+    auth: "entra" (Azure, Microsoft Entra ID), "azure-key" (Azure ``api-key``
+    header), or "openai-key" (OpenAI bearer key). Keys come only from callers;
+    they are never logged or persisted.
+    """
+    if auth not in {"entra", "azure-key", "openai-key"}:
+        raise DeepThinkError(f"Unknown auth mode {auth!r}.")
+    if auth != "entra" and (not isinstance(api_key, str) or not api_key.strip()):
+        variable = "AZURE_OPENAI_API_KEY" if auth == "azure-key" else "OPENAI_API_KEY"
+        raise DeepThinkError(
+            f"An API key is required for {auth} authentication. Set {variable} "
+            "(or a resource-specific key variable) in the environment."
+        )
+    if auth == "openai-key":
+        base_url = _validate_openai_endpoint(endpoint)
+        _refuse_cross_provider_host("openai", base_url)
+        return (openai_factory or _import_openai())(
+            base_url=base_url,
+            api_key=api_key.strip(),
+            max_retries=0,
+            timeout=DEFAULT_REQUEST_TIMEOUT,
+        )
     if not isinstance(endpoint, str) or not endpoint.strip():
         raise DeepThinkError(
             "Azure OpenAI endpoint is required. Set AZURE_OPENAI_ENDPOINT "
@@ -532,6 +615,7 @@ def create_client(
     parsed_endpoint = urlsplit(endpoint)
     if parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc:
         raise DeepThinkError("Azure OpenAI endpoint must use HTTPS and include a host.")
+    _refuse_cross_provider_host("azure", endpoint)
     query = parse_qsl(parsed_endpoint.query, keep_blank_values=True)
     preview_endpoint = (
         parsed_endpoint.path.rstrip("/") == "/openai/responses"
@@ -555,6 +639,19 @@ def create_client(
             (parsed_endpoint.scheme, parsed_endpoint.netloc, "/openai/", "", "")
         )
         client_options["default_query"] = {"api-version": query[0][1]}
+
+    normalized_endpoint = endpoint.rstrip("/") + "/"
+    if auth == "azure-key":
+        # An empty SDK key suppresses the Authorization header, so Azure sees
+        # only its documented api-key header.
+        return (openai_factory or _import_openai())(
+            base_url=normalized_endpoint,
+            api_key="",
+            default_headers={"api-key": api_key.strip()},
+            max_retries=0,
+            timeout=DEFAULT_REQUEST_TIMEOUT,
+            **client_options,
+        )
 
     if (
         credential_factory is None
@@ -580,7 +677,6 @@ def create_client(
         token_provider_factory = token_provider_factory or get_bearer_token_provider
         openai_factory = openai_factory or OpenAI
 
-    normalized_endpoint = endpoint.rstrip("/") + "/"
     token_provider = token_provider_factory(
         credential_factory(),
         ENTRA_SCOPE,
@@ -595,17 +691,21 @@ def create_client(
 
 
 class RouteTarget:
-    def __init__(self, deployment, client, resource=None, role=None):
+    def __init__(self, deployment, client, resource=None, role=None, provider="azure"):
         self.deployment = deployment
         self.client = client
         self.resource = resource
         self.role = role
+        self.provider = provider
 
 
 class DeploymentRouter:
-    def __init__(self, targets, *, client_factory=None, clients=None):
+    def __init__(self, targets, *, client_factory=None, clients=None, provider="azure"):
+        self.provider = provider
         self.targets = [
-            target if isinstance(target, RouteTarget) else RouteTarget(*target)
+            target
+            if isinstance(target, RouteTarget)
+            else RouteTarget(*target, provider=provider)
             for target in targets
         ]
         self._client_factory = client_factory
@@ -632,6 +732,8 @@ def create_routed_client(
     backup_deployment=None,
     fallback_endpoint=None,
     client_factory=create_client,
+    fallback_deployments=DEFAULT_FALLBACK_DEPLOYMENTS,
+    provider="azure",
 ):
     clients = {}
 
@@ -640,7 +742,9 @@ def create_routed_client(
             clients[resource] = client_factory(resource)
         return clients[resource]
 
-    targets = [RouteTarget(deployment, client_for(endpoint), endpoint, "primary")]
+    targets = [
+        RouteTarget(deployment, client_for(endpoint), endpoint, "primary", provider)
+    ]
     if backup_endpoint:
         targets.append(
             RouteTarget(
@@ -648,19 +752,46 @@ def create_routed_client(
                 client_for(backup_endpoint),
                 backup_endpoint,
                 "backup",
+                provider,
             )
         )
     fallback_resource = fallback_endpoint or endpoint
-    for fallback in _deployment_chain(deployment)[1:]:
+    for fallback in _deployment_chain(deployment, fallback_deployments)[1:]:
         targets.append(
             RouteTarget(
-                fallback, client_for(fallback_resource), fallback_resource, "fallback"
+                fallback,
+                client_for(fallback_resource),
+                fallback_resource,
+                "fallback",
+                provider,
             )
         )
-    return DeploymentRouter(targets, client_factory=client_factory, clients=clients)
+    return DeploymentRouter(
+        targets, client_factory=client_factory, clients=clients, provider=provider
+    )
+
+
+def _attempt_provider(attempt):
+    # Journals written before provider support contain only Azure jobs.
+    return attempt.get("provider") or "azure"
+
+
+def _provider_mismatch(attempt, provider):
+    """Explain why an attempt cannot be recovered through provider, or None."""
+    recorded = _attempt_provider(attempt)
+    if recorded == provider:
+        return None
+    return (
+        f"{attempt.get('response_id') or attempt.get('attempt_id')} was submitted "
+        f"through the {recorded} provider, so {provider} credentials will not be "
+        f"sent to it; rerun with --provider {recorded}"
+    )
 
 
 def _target_for_attempt(router, attempt):
+    mismatch = _provider_mismatch(attempt, router.provider)
+    if mismatch is not None:
+        raise DeepThinkError(f"Recorded response {mismatch}.")
     for index, target in enumerate(router.targets):
         if (
             target.deployment == attempt["deployment"]
@@ -677,6 +808,7 @@ def _target_for_attempt(router, attempt):
         router.client_for(attempt["resource"]),
         attempt["resource"],
         attempt.get("role"),
+        router.provider,
     )
 
 
@@ -1911,6 +2043,7 @@ ATTEMPT_RECORD_FIELDS = (
     "deployment",
     "resource",
     "role",
+    "provider",
     "target_index",
     "target_count",
 )
@@ -2227,6 +2360,7 @@ class RequestJournal:
             deployment=target.deployment,
             resource=target.resource,
             role=target.role,
+            provider=target.provider,
             target_index=target_index,
             target_count=target_count,
             pid=os.getpid(),
@@ -3791,6 +3925,7 @@ def _attempt_summary(attempt, state):
         "response_id": attempt["response_id"],
         "deployment": attempt["deployment"],
         "resource": attempt["resource"],
+        "provider": _attempt_provider(attempt),
         "role": attempt["role"],
         "target": f"{attempt['target_index']}/{attempt['target_count']}",
         "submitted_at": attempt["submitted_at"],
@@ -3823,6 +3958,9 @@ def _committed_summary(project_dir):
 
 
 def _next_steps(project, lock, outstanding, unresolved, recoverable):
+    # Recovery must use the provider that accepted the jobs; Azure is the default.
+    providers = {item["provider"] for item in (*outstanding, *recoverable)}
+    flag = " --provider openai" if providers == {"openai"} else ""
     command = "deep_think.py"
     steps = []
     if lock["state"] in {"live", "busy"}:
@@ -3833,32 +3971,33 @@ def _next_steps(project, lock, outstanding, unresolved, recoverable):
     if lock["state"] == "unverifiable":
         steps.append(
             "After confirming the lock owner has exited, run "
-            f"`{command} reconcile --project {project} --release-lock`."
+            f"`{command} reconcile --project {project}{flag} --release-lock`."
         )
     active = [item["response_id"] for item in outstanding if item["state"] == "active"]
     if active:
         steps.append(
-            f"Run `{command} resume --project {project}` to keep polling "
+            f"Run `{command} resume --project {project}{flag}` to keep polling "
             f"{', '.join(active)} on the original resource without resubmitting, "
-            f"or `{command} cancel --project {project}` to stop it. "
-            f"`{command} reconcile --project {project}` records current remote status."
+            f"or `{command} cancel --project {project}{flag}` to stop it. "
+            f"`{command} reconcile --project {project}{flag}` records current "
+            "remote status."
         )
     if recoverable:
         steps.append(
-            f"Run `{command} resume --project {project}` to commit the cached "
+            f"Run `{command} resume --project {project}{flag}` to commit the cached "
             "completed response without a new request."
         )
     if unresolved or any(item["state"] == "unknown" for item in outstanding):
         steps.append(
-            "Azure may have accepted a request whose response ID was never "
-            "recorded. Search Azure telemetry using the recorded time, deployment, "
-            "resource, and request SHA-256."
+            "The service may have accepted a request whose response ID was never "
+            "recorded. Search Azure telemetry or the OpenAI dashboard logs using "
+            "the recorded time, deployment, resource, and request SHA-256."
         )
         steps.append(
-            f"If found, run `{command} reconcile --project {project} --attempt "
+            f"If found, run `{command} reconcile --project {project}{flag} --attempt "
             "ATTEMPT --response-id ID` (for a pre-journal writer: `--response-id ID "
             "--endpoint URL`). If you verify that no job remains active, run "
-            f"`{command} reconcile --project {project} --confirm-no-remote-job "
+            f"`{command} reconcile --project {project}{flag} --confirm-no-remote-job "
             "--reason TEXT`."
         )
     return steps or ["No recovery action is required."]
@@ -4002,7 +4141,9 @@ def _remote_call(client_factory, clients, resource, operation, response_id):
     return "response", response
 
 
-def cancel_requests(client_factory, *, root, project, response_ids=(), endpoint=None):
+def cancel_requests(
+    client_factory, *, root, project, response_ids=(), endpoint=None, provider="azure"
+):
     """Cancel journaled (or explicitly identified) background responses."""
     project_dir = _existing_project_dir(root, project)
     results = []
@@ -4028,6 +4169,12 @@ def cancel_requests(client_factory, *, root, project, response_ids=(), endpoint=
             ]
         clients = {}
         for response_id, resource, attempt in plan:
+            mismatch = _provider_mismatch(attempt, provider) if attempt else None
+            if mismatch is not None:
+                results.append(
+                    {"response_id": response_id, "status": None, "error": mismatch}
+                )
+                continue
             attempt_fields = (
                 {"attempt_id": attempt["attempt_id"], "turn_id": attempt["turn_id"]}
                 if attempt
@@ -4126,12 +4273,16 @@ def _record_observed_response(journal, attempt, response):
     return status, status
 
 
-def _refresh_active_attempts(journal, client_factory, clients, actions):
+def _refresh_active_attempts(journal, client_factory, clients, actions, provider):
     view = journal.view()
     for attempt in view.attempts.values():
         if view.attempt_state(attempt) != "active":
             continue
         response_id = attempt["response_id"]
+        mismatch = _provider_mismatch(attempt, provider)
+        if mismatch is not None:
+            actions.append(f"{response_id}: not observed; {mismatch}")
+            continue
         kind, value = _remote_call(
             client_factory, clients, attempt["resource"], "retrieve", response_id
         )
@@ -4156,6 +4307,7 @@ def reconcile_project(
     abandon_turn=False,
     reason=None,
     release_lock=False,
+    provider="azure",
 ):
     """Record observed remote state and explicit operator resolutions."""
     reason = reason.strip() if isinstance(reason, str) else None
@@ -4247,7 +4399,7 @@ def reconcile_project(
                     )
                 else:
                     actions.append(f"{response_id}: {status or value}")
-        _refresh_active_attempts(journal, client_factory, clients, actions)
+        _refresh_active_attempts(journal, client_factory, clients, actions, provider)
         view = journal.view()
         if confirm_no_remote_job:
             attempts = [
@@ -4313,12 +4465,35 @@ def _add_project_arguments(parser):
     )
 
 
+def _add_connection_arguments(parser):
+    parser.add_argument(
+        "--provider",
+        choices=("azure", "openai"),
+        help=(
+            "Model provider. Defaults to DEEP_THINK_PROVIDER, then Azure when an "
+            "endpoint option or Azure endpoint variable is set, otherwise OpenAI "
+            "when OPENAI_API_KEY is set."
+        ),
+    )
+    parser.add_argument(
+        "--azure-auth",
+        choices=("entra", "key"),
+        help=(
+            "Azure authentication. Defaults to DEEP_THINK_AZURE_AUTH, then key "
+            "when an Azure API key variable is set, otherwise Microsoft Entra ID."
+        ),
+    )
+
+
 def _add_routing_arguments(parser):
+    _add_connection_arguments(parser)
     parser.add_argument(
         "--endpoint",
         help=(
             "Primary v1 endpoint or preview Responses URL. Defaults to "
-            "AZURE_OPENAI_GPT6_ENDPOINT, then AZURE_OPENAI_ENDPOINT."
+            "AZURE_OPENAI_GPT6_ENDPOINT, then AZURE_OPENAI_ENDPOINT; for OpenAI "
+            "(requires --provider openai when given), OPENAI_BASE_URL or "
+            "https://api.openai.com/v1/."
         ),
     )
     parser.add_argument(
@@ -4414,6 +4589,7 @@ def _build_parser():
         help="Cancel active background responses on their original resources.",
     )
     _add_project_arguments(cancel)
+    _add_connection_arguments(cancel)
     cancel.add_argument("--response-id", action="append", dest="response_ids")
     cancel.add_argument(
         "--endpoint",
@@ -4425,6 +4601,7 @@ def _build_parser():
         help="Record observed remote state and explicit recovery decisions.",
     )
     _add_project_arguments(reconcile)
+    _add_connection_arguments(reconcile)
     reconcile.add_argument("--response-id")
     reconcile.add_argument(
         "--endpoint",
@@ -4466,7 +4643,69 @@ def _prompt_from_args(args, stdin):
     return stdin.read()
 
 
+def _resolve_connection(args):
+    """Return (provider, azure_auth); azure_auth is None for OpenAI."""
+    provider = getattr(args, "provider", None) or os.getenv("DEEP_THINK_PROVIDER")
+    if provider is not None:
+        provider = provider.strip().lower()
+        if provider not in {"azure", "openai"}:
+            raise DeepThinkError(
+                f"Unknown provider {provider!r}; use 'azure' or 'openai'."
+            )
+    elif any(getattr(args, option, None) for option in ENDPOINT_OPTIONS) or any(
+        os.getenv(name) for name in CONFIGURED_ENDPOINT_VARIABLES
+    ):
+        # Endpoint options have always meant Azure; OpenAI needs --provider.
+        provider = "azure"
+    else:
+        provider = "openai" if os.getenv("OPENAI_API_KEY") else "azure"
+    if provider == "openai":
+        return provider, None
+    auth = getattr(args, "azure_auth", None) or os.getenv("DEEP_THINK_AZURE_AUTH")
+    if auth is not None:
+        auth = auth.strip().lower()
+        if auth not in {"entra", "key"}:
+            raise DeepThinkError(
+                f"Unknown Azure auth mode {auth!r}; use 'entra' or 'key'."
+            )
+        return provider, auth
+    key_variables = ("AZURE_OPENAI_API_KEY", *AZURE_KEY_VARIABLES.values())
+    return provider, "key" if any(
+        os.getenv(name) for name in key_variables
+    ) else "entra"
+
+
+def _configured_client_factory(args):
+    provider, azure_auth = _resolve_connection(args)
+    if provider == "openai":
+        key = os.getenv("OPENAI_API_KEY")
+        return lambda resource: create_client(resource, auth="openai-key", api_key=key)
+    if azure_auth == "entra":
+        return lambda resource: create_client(resource)
+    keys = {}
+    for endpoint_variable, key_variable in AZURE_KEY_VARIABLES.items():
+        endpoint, key = os.getenv(endpoint_variable), os.getenv(key_variable)
+        if endpoint and key:
+            keys[_endpoint_key(endpoint)] = key
+    default_key = os.getenv("AZURE_OPENAI_API_KEY")
+
+    def factory(resource):
+        key = keys.get(_endpoint_key(resource)) if isinstance(resource, str) else None
+        return create_client(resource, auth="azure-key", api_key=key or default_key)
+
+    return factory
+
+
 def _router_from_args(args, deployment, client_factory):
+    provider, _azure_auth = _resolve_connection(args)
+    if provider == "openai":
+        return create_routed_client(
+            args.endpoint or os.getenv("OPENAI_BASE_URL") or OPENAI_DEFAULT_BASE_URL,
+            deployment,
+            client_factory=client_factory,
+            fallback_deployments=DEFAULT_OPENAI_FALLBACK_MODELS,
+            provider=provider,
+        )
     legacy_deployment = deployment in DEFAULT_FALLBACK_DEPLOYMENTS
     endpoint = (
         args.endpoint
@@ -4492,6 +4731,7 @@ def _router_from_args(args, deployment, client_factory):
         ),
         fallback_endpoint=args.fallback_endpoint,
         client_factory=client_factory,
+        provider=provider,
     )
 
 
@@ -4500,25 +4740,36 @@ def _endpoint_key(endpoint):
 
 
 def _trusted_client_factory(client_factory, args):
-    """Send Entra tokens only to endpoints configured for this invocation."""
-    configured = [os.getenv(name) for name in CONFIGURED_ENDPOINT_VARIABLES]
-    configured += [
-        getattr(args, option, None)
-        for option in ("endpoint", "backup_endpoint", "fallback_endpoint")
-    ]
+    """Send credentials only to endpoints configured for the selected provider."""
+    provider = _resolve_connection(args)[0]
+    if provider == "openai":
+        configured = [
+            getattr(args, "endpoint", None),
+            os.getenv("OPENAI_BASE_URL") or OPENAI_DEFAULT_BASE_URL,
+        ]
+        other, options = "azure", "--endpoint"
+    else:
+        configured = [os.getenv(name) for name in CONFIGURED_ENDPOINT_VARIABLES]
+        configured += [getattr(args, option, None) for option in ENDPOINT_OPTIONS]
+        other = "openai"
+        options = (
+            "--endpoint (for resume: --endpoint, --backup-endpoint, or "
+            "--fallback-endpoint)"
+        )
     trusted = {_endpoint_key(value) for value in configured if value}
 
     def factory(resource):
         # Journal resources may be tampered with; None carries no destination.
-        if resource is not None and (
-            not isinstance(resource, str) or _endpoint_key(resource) not in trusted
-        ):
-            raise DeepThinkError(
-                f"Recorded resource {resource!r} is not a configured endpoint, so "
-                "Azure credentials will not be sent to it. If it is legitimate, "
-                "pass it explicitly with --endpoint (for resume: --endpoint, "
-                "--backup-endpoint, or --fallback-endpoint)."
-            )
+        if resource is not None:
+            if not isinstance(resource, str) or _endpoint_key(resource) not in trusted:
+                raise DeepThinkError(
+                    f"Recorded resource {resource!r} is not a configured endpoint "
+                    f"for the {provider} provider, so credentials will not be sent "
+                    f"to it. If it belongs to {other}, rerun with --provider "
+                    f"{other}; if it is a legitimate {provider} endpoint, pass it "
+                    f"explicitly with {options}."
+                )
+            _refuse_cross_provider_host(provider, resource)
         return client_factory(resource)
 
     return factory
@@ -4538,7 +4789,6 @@ def main(
     if hasattr(stdout, "reconfigure"):
         stdout.reconfigure(encoding="utf-8")
     args = _build_parser().parse_args(argv)
-    client_factory = _trusted_client_factory(client_factory, args)
 
     def report_retry(event):
         stderr.write(
@@ -4548,6 +4798,11 @@ def main(
         )
 
     try:
+        if args.command != "status":
+            provider = _resolve_connection(args)[0]
+            if client_factory is create_client:
+                client_factory = _configured_client_factory(args)
+            client_factory = _trusted_client_factory(client_factory, args)
         if args.command == "status":
             report = project_status(args.root, args.project)
         elif args.command == "cancel":
@@ -4557,6 +4812,7 @@ def main(
                 project=args.project,
                 response_ids=args.response_ids or (),
                 endpoint=args.endpoint,
+                provider=provider,
             )
         elif args.command == "reconcile":
             report = reconcile_project(
@@ -4570,6 +4826,7 @@ def main(
                 abandon_turn=args.abandon_turn,
                 reason=args.reason,
                 release_lock=args.release_lock,
+                provider=provider,
             )
         elif args.command == "resume":
             report = None

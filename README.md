@@ -1,13 +1,17 @@
 # Deep Think
 
-`deep-think` is an agent skill for persistent mathematical research with Azure
-OpenAI GPT-6 Astra, with GPT-5.6 Sol and GPT-5.4 Pro backups. It is intended for
-difficult theorem proving, open-problem investigation, counterexample search,
-novel constructions, and theory building.
+`deep-think` is an agent skill for persistent mathematical research with
+GPT-6 Astra, with GPT-5.6 Sol and GPT-5.4 Pro backups, through Azure OpenAI or
+the OpenAI API. It is intended for difficult theorem proving, open-problem
+investigation, counterexample search, novel constructions, and theory building.
+It follows the open [Agent Skills](https://agentskills.io) format, so the same
+folder works in GitHub Copilot CLI, OpenAI Codex, Claude Code, opencode, pi, and
+other compatible agents.
 
 The runner uses:
 
-- Microsoft Entra ID authentication through `DefaultAzureCredential`
+- Azure OpenAI with Microsoft Entra ID (default) or an API key, or OpenAI with
+  an API key
 - Responses API `pro` mode with maximum reasoning effort
 - Background execution and polling for long-running reasoning requests
 - Conservative local context budgets, retained across model failover
@@ -15,40 +19,86 @@ The runner uses:
 - Stateless encrypted-context replay and automatic summarized rollover
 - Bounded retries, malformed-response validation, integrity checks, and
   visible-transcript recovery
-- Ordered error/rate-limit failover across two `gpt-6-astra` resources,
-  `gpt-5.6-sol`, `gpt-5.6-sol-nofilters`, and `gpt-5.4-pro`
+- Ordered error/rate-limit failover: on Azure, two `gpt-6-astra` resources,
+  `gpt-5.6-sol`, `gpt-5.6-sol-nofilters`, and `gpt-5.4-pro`; on OpenAI,
+  `gpt-6-astra`, `gpt-5.6-sol`, and `gpt-5.4-pro`
 
-No API keys are accepted or stored. The repository contains no Azure resource
-endpoint, access token, client secret, tenant identifier, or client identifier.
+Credentials come only from your environment. API keys are never accepted as
+command-line arguments, logged, or written to transcripts or journals. The
+repository contains no endpoint, key, token, tenant, or client identifier.
 
-## Install in a project
+## Install for your agent
 
-Add this repository as the project's skill directory:
+Clone the skill into a folder your agent scans, then install its dependencies.
+One personal copy in `~/.agents/skills` serves Copilot CLI, Codex, opencode,
+and pi; Claude Code reads `~/.claude/skills`.
 
-```powershell
-git submodule add https://github.com/andyzengmath/deep-think.git ".github\skills\deep-think"
-git submodule update --init --recursive
-python -m pip install --upgrade -r ".github\skills\deep-think\scripts\requirements.txt"
+| Agent | Personal skills | Project skills |
+| --- | --- | --- |
+| GitHub Copilot CLI | `~/.copilot/skills`, `~/.agents/skills` | `.github/skills`, `.agents/skills`, `.claude/skills` |
+| OpenAI Codex | `~/.agents/skills` | `.agents/skills` |
+| Claude Code | `~/.claude/skills` | `.claude/skills` |
+| opencode | `~/.config/opencode/skills`, `~/.agents/skills`, `~/.claude/skills` | `.opencode/skills`, `.agents/skills`, `.claude/skills` |
+| pi | `~/.pi/agent/skills`, `~/.agents/skills` | `.pi/skills`, `.agents/skills` |
+
+macOS or Linux:
+
+```bash
+git clone https://github.com/andyzengmath/deep-think.git ~/.agents/skills/deep-think
+ln -s ~/.agents/skills/deep-think ~/.claude/skills/deep-think   # Claude Code
+python3 -m pip install --upgrade -r ~/.agents/skills/deep-think/scripts/requirements.txt
 ```
 
-Add this instruction to the project's root `CLAUDE.md` so it applies to all
-descendant directories:
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/andyzengmath/deep-think.git "$HOME\.agents\skills\deep-think"
+New-Item -ItemType Junction -Path "$HOME\.claude\skills\deep-think" -Target "$HOME\.agents\skills\deep-think"   # Claude Code
+python -m pip install --upgrade -r "$HOME\.agents\skills\deep-think\scripts\requirements.txt"
+```
+
+Create the parent `skills` folder first if it does not exist. To share the
+skill with a project instead, add it as a submodule in a project folder from the
+table, for example `git submodule add https://github.com/andyzengmath/deep-think.git .agents/skills/deep-think`.
+Restart the agent (or reload its skills) after installing.
+
+To make agents use the skill for mathematics, add this to the project's
+`AGENTS.md` (Codex, Copilot, opencode, pi) or `CLAUDE.md` (Claude Code),
+adjusting the path to your installation:
 
 ```markdown
 For theorem proving, open-problem research, counterexample searches, difficult
-mathematical constructions, or theory building, read and follow
-`.github\skills\deep-think\SKILL.md` before doing substantive mathematical
-reasoning.
+mathematical constructions, or theory building, use the deep-think skill
+(read its SKILL.md) before doing substantive mathematical reasoning.
 
-For sustained research, follow the skill's `references\graph-search-workflow.md`.
+For sustained research, follow the skill's `references/graph-search-workflow.md`.
 Load the project's `research-graph.json` before continuing; update it after
 each bounded research episode and before a handoff.
 ```
 
 ## Configure and authenticate
 
-The Azure resource endpoint is intentionally not committed. Configure it in
-the current shell, then authenticate with Microsoft Entra ID:
+Choose one provider. The runner selects Azure when an Azure endpoint variable
+or endpoint option is set, otherwise OpenAI when `OPENAI_API_KEY` is set;
+override with `--provider azure|openai` or `DEEP_THINK_PROVIDER`. Credentials
+never cross providers: each job records its provider, and recovery commands act
+on it only through that provider.
+
+**OpenAI API key** (simplest):
+
+```bash
+export OPENAI_API_KEY=...        # PowerShell: $env:OPENAI_API_KEY = Read-Host "OpenAI API key"
+# Optional: export OPENAI_BASE_URL=https://api.openai.com/v1/
+```
+
+**Azure OpenAI with an API key:** set the endpoints below and
+`AZURE_OPENAI_API_KEY` (or per-resource `AZURE_OPENAI_GPT6_API_KEY`,
+`AZURE_OPENAI_GPT6_BACKUP_API_KEY`, `AZURE_OPENAI_FALLBACK_API_KEY`). Key
+authentication is selected automatically when a key is set, or explicitly with
+`--azure-auth key`.
+
+**Azure OpenAI with Microsoft Entra ID** (default for Azure, no keys): set the
+endpoints, then sign in:
 
 ```powershell
 az login
@@ -89,7 +139,7 @@ managed identity, CI, validation, and troubleshooting instructions.
 Start an investigation:
 
 ```powershell
-python ".github\skills\deep-think\scripts\deep_think.py" ask `
+python "<skill-dir>/scripts/deep_think.py" ask `
   --project "project-slug" `
   --title "Research title" `
   --prompt-file "path\to\problem.md"
@@ -98,7 +148,7 @@ python ".github\skills\deep-think\scripts\deep_think.py" ask `
 Continue it by reusing the project slug:
 
 ```powershell
-python ".github\skills\deep-think\scripts\deep_think.py" ask `
+python "<skill-dir>/scripts/deep_think.py" ask `
   --project "project-slug" `
   --prompt "Audit the proposed proof and repair every gap."
 ```
@@ -115,8 +165,8 @@ polling timeout, inspect the project and continue without duplicating paid
 requests:
 
 ```powershell
-python ".github\skills\deep-think\scripts\deep_think.py" status --project "project-slug"
-python ".github\skills\deep-think\scripts\deep_think.py" resume --project "project-slug"
+python "<skill-dir>/scripts/deep_think.py" status --project "project-slug"
+python "<skill-dir>/scripts/deep_think.py" resume --project "project-slug"
 ```
 
 `resume` polls known jobs on their original resources and commits cached
@@ -146,10 +196,10 @@ problem. No extra database or scheduler is required.
 
 ```powershell
 python -B -m unittest discover `
-  -s ".github\skills\deep-think\tests" `
+  -s "<skill-dir>/tests" `
   -p "test_*.py"
-ruff check ".github\skills\deep-think"
-ruff format --check ".github\skills\deep-think"
+ruff check "<skill-dir>"
+ruff format --check "<skill-dir>"
 ```
 
 See [SKILL.md](SKILL.md) for the complete agent workflow and

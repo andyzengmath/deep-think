@@ -16,9 +16,18 @@ Use this reference when maintaining or debugging the runner.
 - Error/rate-limit fallbacks: GPT-6 backup resource, `gpt-5.6-sol`,
   `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro` on the legacy resource.
 - API: Responses
-- Authentication: `DefaultAzureCredential(process_timeout=60)` and
+- Providers: Azure OpenAI (default when an Azure endpoint variable or endpoint
+  option is set) or OpenAI (`--provider openai`, `OPENAI_API_KEY`, optional
+  `OPENAI_BASE_URL`, model chain `gpt-6-astra`, `gpt-5.6-sol`,
+  `gpt-5.4-pro`). Journal `submitting` records include `provider` (absent
+  means Azure); recovery refuses jobs from the other provider, and
+  credentials are refused for the other provider's hosts.
+- Authentication: Azure Entra ID by default through
+  `DefaultAzureCredential(process_timeout=60)` and
   `get_bearer_token_provider(..., "https://ai.azure.com/.default")`; the longer
-  subprocess timeout accommodates slow Azure CLI token commands.
+  subprocess timeout accommodates slow Azure CLI token commands. Azure API keys
+  (`--azure-auth key`) are sent only in the `api-key` header (the SDK key is
+  empty, so no `Authorization` header is sent). OpenAI keys use bearer auth.
 - GPT-6 and GPT-5.6 reasoning: `{"mode": "pro", "effort": "max",
   "context": "all_turns", "summary": "auto"}`
 - GPT-5.4 Pro fallback reasoning: `{"effort": "xhigh",
@@ -31,8 +40,9 @@ Use this reference when maintaining or debugging the runner.
 - Client request timeout: 3,600 seconds
 - SDK retries: disabled with `max_retries=0`; the runner owns retry policy
 
-Pass the bearer token provider callable to `OpenAI(api_key=...)`. Do not read,
-accept, or persist API keys.
+Pass the Entra bearer token provider callable to `OpenAI(api_key=...)`. Read
+API keys only from environment variables; never accept them as command-line
+arguments, and never log or persist them.
 
 The endpoint must use HTTPS and include a host. The runner rejects endpoints
 containing user information, arbitrary query parameters, or fragments. The

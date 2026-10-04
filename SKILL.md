@@ -1,6 +1,6 @@
 ---
 name: deep-think
-description: "Run persistent, maximum-depth mathematical research through Azure OpenAI GPT-6 Astra with GPT-5.6 Sol and GPT-5.4 Pro backups, Microsoft Entra ID, Responses API pro mode, max reasoning effort, structured Markdown, local full-context replay, automatic long-context rollover summaries, and journaled crash recovery (status, resume, cancel, reconcile). Use for open problems, difficult proofs, counterexample searches, novel constructions, deep theory development, any long multi-turn math investigation needing version-controlled continuity, or recovering an interrupted, locked, or still-running deep-think request without duplicating paid work."
+description: "Run persistent, maximum-depth mathematical research with GPT-6 Astra (GPT-5.6 Sol and GPT-5.4 Pro backups) through Azure OpenAI (Microsoft Entra ID or API key) or the OpenAI API, using Responses API pro mode, max reasoning effort, structured Markdown, local full-context replay, automatic long-context rollover summaries, and journaled crash recovery (status, resume, cancel, reconcile). Use for open problems, difficult proofs, counterexample searches, novel constructions, deep theory development, any long multi-turn math investigation needing version-controlled continuity, or recovering an interrupted, locked, or still-running deep-think request without duplicating paid work."
 ---
 
 # Deep Think
@@ -11,32 +11,36 @@ turns.
 
 ## Prepare
 
-Resolve bundled scripts and references relative to this loaded skill's base
-directory, not the working repository. The examples below show a project
-installation; for a personal Copilot CLI installation, use
-`$HOME\.copilot\skills\deep-think\scripts\deep_think.py` instead. Keep the
-working directory and transcript root in the research project, not the skill
-directory. Use the current shell's Azure configuration and Entra authentication;
-Copilot's GitHub login does not authenticate Azure requests.
+Run bundled scripts from this skill's own folder, not the working repository.
+In the commands below, `<skill-dir>` means that folder (for example
+`~/.agents/skills/deep-think`, `~/.claude/skills/deep-think`, or a project's
+`.agents/skills/deep-think`); use `python3` where `python` is unavailable. Keep
+the working directory and transcript root in the research project. Model
+credentials come only from the shell environment; your agent's own login does
+not authenticate model requests.
 
 1. Read [references/research-protocol.md](references/research-protocol.md) before
    starting or resuming an investigation.
    For sustained research, also follow
-   `references\graph-search-workflow.md`: locate and read the project's
+   `references/graph-search-workflow.md`: locate and read the project's
    `research-graph.json` before selecting another mathematical action.
    Initialize a new graph only for a genuinely new project, not because the
    current working directory changed.
 2. Install the current SDKs if the runner reports missing dependencies:
 
-   ```powershell
-   python -m pip install --upgrade -r ".github\skills\deep-think\scripts\requirements.txt"
+   ```bash
+   python -m pip install --upgrade -r "<skill-dir>/scripts/requirements.txt"
    ```
 
-3. Follow [CONFIGURATION.md](CONFIGURATION.md) to grant the required Azure role
-   and authenticate through `DefaultAzureCredential`. Use `az login` for local
-   development or a managed identity in Azure. Never add an API key.
-4. Configure the resource-specific endpoint and deployment in the current
-   shell. The endpoint has no committed default:
+3. Confirm a provider is configured (see [CONFIGURATION.md](CONFIGURATION.md)).
+   Never ask for, print, or write a key; keys stay in environment variables.
+   - **OpenAI:** `OPENAI_API_KEY` (optional `OPENAI_BASE_URL`).
+   - **Azure, API key:** the endpoints below plus `AZURE_OPENAI_API_KEY` or a
+     per-resource key variable.
+   - **Azure, Microsoft Entra ID (default for Azure):** the endpoints below and
+     `az login` or a managed identity.
+
+   Azure endpoint variables have no committed default:
 
    ```powershell
    $env:AZURE_OPENAI_GPT6_ENDPOINT = Read-Host "GPT-6 primary Responses URL (East US)"
@@ -48,7 +52,9 @@ Copilot's GitHub login does not authenticate Azure requests.
    Both GPT-6 names default to `gpt-6-astra`; use
    `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` for a differently named backup.
    Accept v1 base URLs or full preview Responses URLs with only an
-   `api-version` query parameter.
+   `api-version` query parameter. Override detection with
+   `--provider azure|openai` and `--azure-auth entra|key`; an explicit
+   `--endpoint` selects Azure unless `--provider openai` is also given.
    Remove stale `AZURE_OPENAI_DEPLOYMENT` overrides to use the new default.
 
 Read [references/azure-openai.md](references/azure-openai.md) only when changing
@@ -60,7 +66,7 @@ Use one stable lowercase project slug for the entire investigation. Supply the
 title only on the first turn.
 
 ```powershell
-python ".github\skills\deep-think\scripts\deep_think.py" ask `
+python "<skill-dir>/scripts/deep_think.py" ask `
   --project "project-slug" `
   --title "Research title" `
   --prompt-file "path\to\problem.md"
@@ -69,7 +75,7 @@ python ".github\skills\deep-think\scripts\deep_think.py" ask `
 Continue in the same context by reusing the project slug and omitting the title:
 
 ```powershell
-python ".github\skills\deep-think\scripts\deep_think.py" ask `
+python "<skill-dir>/scripts/deep_think.py" ask `
   --project "project-slug" `
   --prompt "Audit the proposed proof of Lemma 4 and repair any gap."
 ```
@@ -83,7 +89,7 @@ to stderr.
 Use the defaults unless the environment requires a different bounded policy:
 
 ```powershell
-python ".github\skills\deep-think\scripts\deep_think.py" ask `
+python "<skill-dir>/scripts/deep_think.py" ask `
   --project "project-slug" `
   --prompt "Continue the proof audit." `
   --max-attempts 5 `
@@ -169,7 +175,7 @@ running, inspect the project first. `status` is read-only and safe while another
 writer runs:
 
 ```powershell
-$runner = ".github\skills\deep-think\scripts\deep_think.py"
+$runner = "<skill-dir>/scripts/deep_think.py"
 python $runner status --project "project-slug"
 python $runner resume --project "project-slug"
 python $runner cancel --project "project-slug"
@@ -200,9 +206,10 @@ original resource is recorded as no longer running, and its output is lost. The
 journal contains prompts and resource endpoint names but no credentials; review
 it before committing, as with transcripts. Treat journals from other people as
 untrusted: the runner rejects artifact names that would leave `requests\` and
-sends credentials only to configured endpoints. After changing endpoint
-configuration, pass an old recorded endpoint explicitly with `--endpoint` to
-resume, cancel, or reconcile its job.
+sends credentials only to endpoints configured for the selected provider. Each
+job records its provider; recover it with that `--provider` (shown in
+`status`). After changing endpoint configuration, pass an old recorded endpoint
+explicitly with `--endpoint` to resume, cancel, or reconcile its job.
 
 ## Continue rigorously
 

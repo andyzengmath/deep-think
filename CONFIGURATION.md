@@ -1,10 +1,36 @@
 # Secure configuration
 
-`deep-think` uses Microsoft Entra ID through `DefaultAzureCredential`. It does
-not accept API keys. Resource-specific values and identity credentials must be
-supplied at runtime; none belong in this repository.
+`deep-think` supports three ways to reach a model. All credentials and
+resource-specific values are supplied at runtime through the environment; none
+belong in this repository, a transcript, a journal, or a command line.
 
-## Prerequisites
+| Provider and auth | Required variables | Optional variables |
+| --- | --- | --- |
+| Azure OpenAI, Microsoft Entra ID (default for Azure) | Azure endpoint variables below; `az login`, managed identity, or workload identity | `DEEP_THINK_AZURE_AUTH=entra` |
+| Azure OpenAI, API key | Azure endpoint variables; `AZURE_OPENAI_API_KEY` | Per-resource keys `AZURE_OPENAI_GPT6_API_KEY`, `AZURE_OPENAI_GPT6_BACKUP_API_KEY`, `AZURE_OPENAI_FALLBACK_API_KEY`; `DEEP_THINK_AZURE_AUTH=key` |
+| OpenAI, API key | `OPENAI_API_KEY` | `OPENAI_BASE_URL` (default `https://api.openai.com/v1/`), `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID` |
+
+Selection: `--provider` or `DEEP_THINK_PROVIDER` wins; otherwise Azure is used
+when an `--endpoint`, `--backup-endpoint`, or `--fallback-endpoint` option or
+any Azure endpoint variable is set, else OpenAI when `OPENAI_API_KEY` is set.
+For Azure, `--azure-auth` or `DEEP_THINK_AZURE_AUTH` wins; otherwise key
+authentication is used when any Azure key variable is set, else Entra ID. A
+per-resource key applies to the endpoint in its matching variable; any other
+resource uses `AZURE_OPENAI_API_KEY`. Azure keys are sent only in the
+`api-key` header; OpenAI keys use the standard bearer header.
+
+Credentials never cross providers. OpenAI keys are refused for Azure hosts
+(`*.azure.com`, `*.azure.us`, `*.azure.cn`), and Azure keys or Entra tokens are
+refused for `openai.com` hosts. Each journaled job records its provider, and
+`resume`, `cancel`, and `reconcile` act on it only through that provider.
+
+On OpenAI the model chain is `gpt-6-astra`, `gpt-5.6-sol`, then
+`gpt-5.4-pro` on one base URL; use `--deployment` to choose another primary
+model. Prefer Entra ID where available. Store keys in an OS keychain, secret
+manager, or CI secret, export them only into the process environment, and
+rotate any key that is exposed.
+
+## Prerequisites (Azure)
 
 You need:
 
@@ -121,7 +147,9 @@ artifacts, but ignore rules are not a substitute for secret scanning.
 ## Command-line override
 
 `--endpoint`, `--backup-endpoint`, and `--fallback-endpoint` override the
-corresponding resources for an isolated run:
+corresponding resources for an isolated run. They select Azure unless
+`--provider openai` is also given; with OpenAI, `--endpoint` replaces the base
+URL, and the backup and fallback options do not apply:
 
 ```powershell
 python "scripts\deep_think.py" ask `
@@ -195,8 +223,8 @@ az account show --output none
 python "scripts\deep_think.py" --help
 ```
 
-When installed as a repository skill, prefix paths with
-`.github\skills\deep-think\`.
+When installed as a skill, prefix paths with the skill folder, for example
+`~/.agents/skills/deep-think/`.
 
 ## Troubleshooting
 
@@ -223,17 +251,34 @@ When installed as a repository skill, prefix paths with
 - **Unfinished turn blocks a new prompt:** run `resume` to finish it, `cancel`
   to stop running jobs, or `reconcile --abandon-turn --reason TEXT`.
 - **Recorded resource is not a configured endpoint:** the journal names an
-  endpoint that is not configured for this run, so the runner will not send
-  Azure credentials to it. If that endpoint is legitimate (for example, you
-  changed configuration while a job ran), pass it explicitly with `--endpoint`.
+  endpoint that is not configured for the selected provider, so the runner will
+  not send credentials to it. If the job used the other provider, rerun with
+  that `--provider`. If the endpoint is legitimate for this provider (for
+  example, you changed configuration while a job ran), pass it explicitly with
+  `--endpoint`.
+- **Job was submitted through the other provider:** `status` lists each job's
+  `provider`, and its next steps include `--provider openai` for OpenAI jobs.
+  Rerun `resume`, `cancel`, or `reconcile` with the provider named in the
+  message.
+- **Refusing to send credentials to another provider's host:** an OpenAI key
+  was about to reach an Azure host, or Azure credentials an `openai.com` host.
+  Correct `--provider`, the endpoint, or `OPENAI_BASE_URL`. For an Azure
+  resource with a key, use `--provider azure --azure-auth key` and
+  `AZURE_OPENAI_API_KEY`.
 - **Request journal has an invalid artifact name:** the journal names a file
   outside its `requests` directory and may have been tampered with. Inspect it
   before continuing; the runner will not read or delete such paths.
 - **Old model still selected:** clear an old `AZURE_OPENAI_DEPLOYMENT`
   override or set it to `gpt-6-astra`, then restart the terminal/agent.
 - **Credential chain selects the wrong account:** inspect `az account show`,
-  choose the intended subscription, and log in again. Do not work around the
-  issue by adding an API key.
+  choose the intended subscription, and log in again.
+- **An API key is required:** key authentication was selected (`--azure-auth
+  key`, `DEEP_THINK_AZURE_AUTH=key`, or `--provider openai`) but the matching
+  key variable is empty. Export it in the agent's environment and restart the
+  agent; never paste keys into prompts or command arguments.
+- **Wrong provider selected:** an Azure endpoint variable or endpoint option
+  takes precedence over `OPENAI_API_KEY`. Set `DEEP_THINK_PROVIDER=openai` or
+  pass `--provider openai`.
 - **`AzureCliCredential: Failed to invoke the Azure CLI`:** check how long
   `az account get-access-token --scope https://ai.azure.com/.default --output
   none` takes. The runner allows developer-credential subprocesses 60 seconds
