@@ -11,6 +11,8 @@ earlier ones.
 | `openai-key` | OpenAI API with an API key | `OPENAI_API_KEY` | `OPENAI_BASE_URL` (default `https://api.openai.com/v1/`), `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID` |
 
 Prefer Microsoft Entra ID where it is available: it needs no long-lived secret.
+When an Azure key is also set, detection tries the key first, so set
+`DEEP_THINK_AUTH=entra` (or `entra,azure-key`) to put Entra ID first.
 
 ## Where settings come from
 
@@ -56,24 +58,34 @@ With several methods, every request follows one ordered chain:
   next provider in the list takes over.
 - Several Azure methods share the same resources. If one cannot sign in
   (no Entra ID token, or HTTP 401/403), the next is used for that resource
-  immediately, and a note is printed to stderr. A method without a credential
-  for a resource, such as a missing per-resource key, is skipped there.
-- If every listed method fails to sign in on a resource, the request moves
-  straight to the next listed provider and does not return to the failed one
-  for that request. Without another provider, the failure is final.
+  immediately, and a note is printed to stderr. A method that cannot be used
+  for a resource, such as a missing per-resource key or `azure-identity` not
+  being installed, is skipped there.
+- If every listed method fails to sign in on a resource, the request moves to
+  another listed provider that has not failed sign-in, wrapping around the
+  chain if attempts remain, and does not return to the failed provider for
+  that request. When no such provider remains, the failure is final.
 - Prompts go only to providers you list. Credentials never cross providers:
   OpenAI keys are refused for Azure hosts (`*.azure.com`, `*.azure.us`,
   `*.azure.cn`), Azure keys or Entra ID tokens are refused for `openai.com`
   hosts, and neither provider's credentials are sent to an endpoint configured
-  for the other (for example, your `OPENAI_BASE_URL`).
+  only for the other (for example, your `OPENAI_BASE_URL`). Clients never
+  follow HTTP redirects.
+- Cross-provider backups cannot reuse hidden reasoning: encrypted reasoning
+  items from one provider are probably not readable by the other. When that
+  happens, the runner recovers from the visible transcript with a summarized
+  rollover, which costs an extra request. Prefer one provider for a long
+  investigation and treat the other as an emergency backup. This has not been
+  verified against both services.
 
 Each journaled job records its provider. `resume`, `cancel`, and `reconcile`
 contact a job only through a listed method of that provider; otherwise they
-report which `--auth` value to use. Because OpenAI hides responses from other
-projects and deletes finished background responses after about 10 minutes, an
-HTTP 404 for an OpenAI job turns it into an unknown submission instead of
-marking it finished; resolve it with `reconcile` as described under
-Troubleshooting.
+report which `--auth` value to use. `cancel` and `reconcile` report a refused
+endpoint, missing credential, or failed sign-in for that job alone and still
+process the others. Because OpenAI hides responses from other projects and
+deletes finished background responses after about 10 minutes, an HTTP 404 for
+an OpenAI job turns it into an unknown submission instead of marking it
+finished; resolve it with `reconcile` as described under Troubleshooting.
 
 ## Azure OpenAI
 
@@ -110,16 +122,18 @@ An explicit `--deployment` that names a fallback deployment uses the fallback
 resource and starts at that point in the chain. Deployment names must exist
 on the resource; a submission-level `DeploymentNotFound` moves on to the next
 model. Deployment names starting with `gpt-5.4` (such as `gpt-5.4-pro-eu`)
-receive the GPT-5.4 Pro reasoning settings described below.
+receive the GPT-5.4 Pro reasoning settings described below. The GPT-6 backup
+deployment name applies only when the primary is the configured GPT-6
+deployment, so an explicitly chosen other model is never answered by GPT-6.
 
 ## OpenAI API
 
 Requests go to `OPENAI_BASE_URL` (default `https://api.openai.com/v1/`). The
 chain is `gpt-6-astra` (or `--deployment`), then `OPENAI_FALLBACK_MODELS`
 (default `gpt-5.6-sol,gpt-5.4-pro`; `none` disables fallbacks). A model your
-account cannot use (`404 model_not_found`) moves on to the next model. The
-primary model name applies to every listed method, so when you combine
-providers keep Azure deployment names equal to the model names.
+project cannot use (`model_not_found`, returned as HTTP 403 or 404) moves on to
+the next model. The primary model name applies to every listed method, so when
+you combine providers keep Azure deployment names equal to the model names.
 
 ## Retries and attempts
 
@@ -237,6 +251,12 @@ GPT-6 Astra on their next successful default turn without discarding history.
 An explicit `--deployment` keeps an older primary. Remove an old
 `AZURE_OPENAI_DEPLOYMENT` override, or set it to `gpt-6-astra`, to use the new
 default.
+
+Earlier releases tried a site-specific GPT-5.6 deployment in the default
+fallback chain. If a project's primary deployment is no longer in the default
+chain, list it in `AZURE_OPENAI_FALLBACK_DEPLOYMENTS`. The project then upgrades
+to GPT-6 as before, and an explicit `--deployment` for it routes to the
+fallback resource.
 
 ## Validate configuration
 

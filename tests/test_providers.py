@@ -820,8 +820,8 @@ class NotFoundClient:
         )
 
 
-class ReviewRegressionTests(ProjectFixture):
-    """Regressions for issues found while reviewing the multi-provider change."""
+class ProviderProjectFixture(ProjectFixture):
+    """Project fixture with CLI helpers for provider tests."""
 
     def cli(self, *arguments, factory=None, log=None):
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -851,6 +851,10 @@ class ReviewRegressionTests(ProjectFixture):
         return self.runner._build_parser().parse_args(
             [command, "--project", "p", *extra]
         )
+
+
+class ReviewRegressionTests(ProviderProjectFixture):
+    """Regressions for issues found while reviewing the multi-provider change."""
 
     def test_endpoints_configured_for_the_other_provider_are_never_trusted(self):
         gateway = "https://gateway.example/openai/v1/"
@@ -1121,6 +1125,248 @@ class ReviewRegressionTests(ProjectFixture):
         journal = (self.project_dir / "requests" / "journal.jsonl").read_text("utf-8")
         self.assertIn("turn_error", journal)
         self.assertNotIn("WXYZ", journal)
+
+
+GATEWAY = "https://contoso.azure-api.net/openai/v1/"
+
+
+class ReviewRoundTwoTests(ProviderProjectFixture):
+    """Regressions for the second review of the multi-provider change."""
+
+    def route(self, *targets, provider="azure"):
+        return self.runner.DeploymentRouter(
+            [self.runner.RouteTarget(*target) for target in targets],
+            provider=provider,
+        )
+
+    def test_openai_403_model_not_found_moves_down_the_chain(self):
+        denied = make_status_error(
+            403,
+            "model_not_found",
+            message="Project `proj_x` does not have access to model `gpt-6-astra`",
+        )
+        client = FakeClient([denied, FakeResponse("resp-ok", "Fallback answer.")])
+        router = self.route(
+            ("gpt-6-astra", client, OPENAI_V1, "primary", "openai"),
+            ("gpt-5.6-sol", client, OPENAI_V1, "fallback", "openai"),
+            provider="openai",
+        )
+        outcome = self.runner.request_response(
+            router,
+            {"model": "gpt-6-astra", "input": "Q."},
+            purpose="answer",
+            sleep=lambda _delay: None,
+        )
+        self.assertEqual(outcome.deployment, "gpt-5.6-sol")
+        first = FakeClient([denied])
+        second = FakeClient([FakeResponse("resp-unused", "Unused.")])
+        fallback = self.runner.AuthFallbackClient(
+            [("azure-key", first), ("entra", second)]
+        )
+        with self.assertRaises(type(denied)):
+            fallback.responses.create(model="gpt-6-astra")
+        self.assertEqual(second.responses.calls, [])
+
+    def test_sign_in_failure_returns_to_a_provider_that_was_only_throttled(self):
+        azure = FakeClient(
+            [
+                make_status_error(429, "rate_limit_exceeded"),
+                FakeResponse("resp-ok", "Answer."),
+            ]
+        )
+        backup = FakeClient([make_status_error(401, "invalid_api_key")])
+        router = self.route(
+            ("gpt-6-astra", azure, AZURE_V1, "primary", "azure"),
+            ("gpt-6-astra", backup, OPENAI_V1, "primary", "openai"),
+        )
+        outcome = self.runner.request_response(
+            router,
+            {"model": "gpt-6-astra", "input": "Q."},
+            purpose="answer",
+            max_attempts=4,
+            base_delay=0,
+            sleep=lambda _delay: None,
+            random_value=lambda: 0,
+        )
+        self.assertEqual(outcome.response.id, "resp-ok")
+        self.assertEqual(len(backup.responses.calls), 1)
+
+    def test_polling_errors_are_redacted_everywhere(self):
+        self.seed()
+        leaked = make_status_error(
+            401,
+            "invalid_api_key",
+            message="Incorrect API key provided: sk-proj-****WXYZ.",
+        )
+        client = FakeClient(
+            [FakeResponse("resp-job", "", status="queued", incomplete_reason=None)],
+            [leaked],
+        )
+        with self.assertRaises(self.runner.DeepThinkError) as raised:
+            self.ask(client)
+        self.assertNotIn("WXYZ", str(raised.exception))
+        journal = (self.project_dir / "requests" / "journal.jsonl").read_text("utf-8")
+        self.assertIn("poll_stopped", journal)
+        self.assertNotIn("WXYZ", journal)
+
+    def test_unavailable_backup_methods_are_skipped_with_one_note(self):
+        def fake_create(resource, **options):
+            if options.get("auth") == "azure-key":
+                return f"key client for {resource}"
+            raise self.runner.DeepThinkError(
+                "Install dependencies with: python -m pip install azure-identity"
+            )
+
+        notes = []
+        environment = {
+            "AZURE_OPENAI_GPT6_ENDPOINT": AZURE_V1,
+            "AZURE_OPENAI_API_KEY": "azure-key-value",
+        }
+        with (
+            mock.patch.dict("os.environ", environment, clear=True),
+            mock.patch.object(self.runner, "create_client", fake_create),
+        ):
+            factory = self.runner._configured_client_factories(
+                ("azure-key", "entra"),
+                on_unavailable=lambda method, error: notes.append(method),
+            )["azure"]
+            self.assertEqual(factory(AZURE_V1), f"key client for {AZURE_V1}")
+            self.assertEqual(factory(GATEWAY), f"key client for {GATEWAY}")
+            only_entra = self.runner._configured_client_factories(("entra",))
+            with self.assertRaisesRegex(self.runner.DeepThinkError, "azure-identity"):
+                only_entra["azure"](AZURE_V1)
+        self.assertEqual(notes, ["entra"])
+
+    def test_production_clients_never_follow_redirects(self):
+        captured = []
+
+        def sdk(**options):
+            captured.append(options)
+            return SimpleNamespace()
+
+        with mock.patch.object(self.runner, "_import_openai", lambda: sdk):
+            self.runner.create_client(AZURE_PREVIEW, auth="azure-key", api_key="k")
+            self.runner.create_client(None, auth="openai-key", api_key="sk")
+            self.runner.create_client(
+                AZURE_PREVIEW,
+                credential_factory=lambda: object(),
+                token_provider_factory=lambda _credential, _scope: lambda: "token",
+            )
+        self.assertEqual(len(captured), 3)
+        for options in captured:
+            self.assertFalse(options["http_client"].follow_redirects)
+
+    def test_openai_jobs_without_a_resource_are_refused(self):
+        seen = []
+        with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "sk"}, clear=True):
+            factory = self.runner._trusted_client_factory(
+                seen.append, self.parse("cancel", "--auth", "openai-key"), "openai"
+            )
+            with self.assertRaises(self.runner.DeepThinkError):
+                factory(None)
+        self.assertEqual(seen, [])
+
+    def test_relative_config_home_and_nul_values_are_rejected(self):
+        default = self.runner.default_env_file({"XDG_CONFIG_HOME": "relative-cfg"})
+        self.assertTrue(default is None or default.is_absolute())
+        path = self.root / "nul.env"
+        path.write_bytes(b"DEEP_THINK_AUTH=entra\x00secret-tail\n")
+        with self.assertRaises(self.runner.DeepThinkError) as raised:
+            self.runner.load_env_file(path, environ={})
+        self.assertNotIn("secret-tail", str(raised.exception))
+
+    def test_endpoints_configured_for_both_providers_stay_usable(self):
+        environment = {
+            "AZURE_OPENAI_ENDPOINT": GATEWAY,
+            "OPENAI_BASE_URL": GATEWAY,
+            "OPENAI_API_KEY": "sk",
+        }
+        seen = []
+        with mock.patch.dict("os.environ", environment, clear=True):
+            self.runner._trusted_client_factory(
+                seen.append, self.parse("cancel"), "azure"
+            )(GATEWAY)
+            self.runner._trusted_client_factory(
+                seen.append, self.parse("cancel", "--auth", "openai-key"), "openai"
+            )(GATEWAY)
+        self.assertEqual(seen, [GATEWAY, GATEWAY])
+
+    def test_gpt6_backup_deployment_applies_only_to_the_configured_primary(self):
+        environment = {
+            "AZURE_OPENAI_GPT6_ENDPOINT": "A",
+            "AZURE_OPENAI_GPT6_BACKUP_ENDPOINT": "B",
+            "AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT": "gpt-6-astra-backup",
+            "AZURE_OPENAI_ENDPOINT": "L",
+        }
+
+        def backup(deployment):
+            with mock.patch.dict("os.environ", environment, clear=True):
+                router = self.runner._router_from_args(
+                    self.parse("ask", "--prompt", "Q."),
+                    deployment,
+                    lambda _resource: object(),
+                )
+            return [
+                (t.deployment, t.resource) for t in router.targets if t.role == "backup"
+            ]
+
+        self.assertEqual(backup("gpt-6-astra"), [("gpt-6-astra-backup", "B")])
+        self.assertEqual(backup("my-model"), [("my-model", "B")])
+
+    def test_cancel_continues_past_one_jobs_error(self):
+        self.seed()
+        self.start_job("azure", AZURE_V1)
+        CrossProviderRecoveryTests.forge_openai_job(self)
+        log = []
+
+        def factory(resource):
+            if resource == PROXY_V1:
+                raise self.runner.DeepThinkError("An API key is required.")
+            return LoggingClient(resource, log)
+
+        environment = {
+            "AZURE_OPENAI_GPT6_ENDPOINT": AZURE_V1,
+            "OPENAI_BASE_URL": PROXY_V1,
+            "DEEP_THINK_AUTH": "entra,openai-key",
+        }
+        with mock.patch.dict("os.environ", environment, clear=True):
+            code, stdout, stderr = self.cli("cancel", factory=factory)
+        self.assertEqual(code, 0, stderr)
+        results = {item["response_id"]: item for item in json.loads(stdout)["results"]}
+        self.assertEqual(results["resp-job"]["status"], "cancelled")
+        self.assertIn("API key", results["resp-openai"]["error"])
+        self.assertEqual(log, [(AZURE_V1, "cancel", "resp-job")])
+
+    def test_tampered_journal_field_types_are_reported(self):
+        self.seed()
+        record = {
+            "schema": "deep-think-request-journal/v1",
+            "recorded_at": "2026-10-04T00:00:00+00:00",
+            "lock_id": None,
+            "event": "submitting",
+            "attempt_id": "bad",
+            "turn_id": "turn",
+            "resource": ["not", "a", "url"],
+        }
+        path = self.project_dir / "requests" / "journal.jsonl"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record) + "\n")
+        with self.assertRaisesRegex(self.runner.DeepThinkError, "tampered"):
+            self.status()
+
+    def test_openai_failures_are_labelled_openai(self):
+        client = FakeClient([make_status_error(400, "invalid_request_error")])
+        router = self.route(
+            ("gpt-6-astra", client, OPENAI_V1, "primary", "openai"),
+            provider="openai",
+        )
+        with self.assertRaisesRegex(self.runner.DeepThinkError, "OpenAI HTTP 400"):
+            self.runner.request_response(
+                router,
+                {"model": "gpt-6-astra", "input": "Q."},
+                purpose="answer",
+                sleep=lambda _delay: None,
+            )
 
 
 if __name__ == "__main__":

@@ -114,9 +114,10 @@ bounded attempts through the chain: `gpt-6-astra` on the primary resource, an
 optional backup GPT-6 resource, then the fallback deployments (by default
 `gpt-5.6-sol`, then `gpt-5.4-pro`; set `AZURE_OPENAI_FALLBACK_DEPLOYMENTS` or
 `OPENAI_FALLBACK_MODELS`), then the chain of the next listed provider. Also
-advance on a submission-level `DeploymentNotFound` 404; other permanent 4xx
-errors remain terminal. If attempts remain, cycle back to the primary. Every
-new logical request starts on the primary.
+advance on a submission-level `DeploymentNotFound` (404) or OpenAI
+`model_not_found` (403 or 404); other permanent 4xx errors remain terminal. If
+attempts remain, cycle back to the primary. Every new logical request starts
+on the primary.
 Preserve `pro` mode and `max` effort on GPT-6 and GPT-5.6 targets. For the
 5.4 fallback only, omit unsupported reasoning mode/context settings and use
 `xhigh`, its maximum supported effort. Record the deployment and effective
@@ -188,7 +189,9 @@ python $runner reconcile --project "project-slug"
   `ask` behaves the same way.
 - `cancel` stops active background jobs on their original resources. If a job
   has already finished, it records the result instead and caches completed
-  output for `resume`.
+  output for `resume`. A job it cannot contact (a refused endpoint, a missing
+  credential, or a failed sign-in) is reported in its result, and the other
+  jobs are still cancelled.
 - `reconcile` records each active job's current remote status and caches
   completed results for `resume`. Use `--attempt ATTEMPT --response-id ID` for
   an ID found in Azure telemetry, `--confirm-no-remote-job --reason TEXT` only

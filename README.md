@@ -134,13 +134,15 @@ Each request then follows one ordered chain, just like the model backup plan:
 3. openai-key   gpt-6-astra → gpt-5.6-sol → gpt-5.4-pro on the OpenAI API
 ```
 
-- Rate limits, server errors, and missing deployments or models move a request
-  to the next model. After the last Azure model, the next provider in the list
-  takes over.
+- Rate limits, server errors, and missing deployments or models (including a
+  model your OpenAI project can't use yet) move a request to the next model.
+  After the last Azure model, the next provider in the list takes over.
 - A failed sign-in (no Entra ID token, or HTTP 401/403) switches to the next
-  method immediately. A method without a credential for a resource, such as a
+  method immediately. A method that can't be used for a resource, such as a
   missing per-resource key, is skipped there.
-- Deep Think never sends a prompt to a provider you did not list.
+- Deep Think never sends a prompt to a provider you did not list. Backup
+  providers can't reuse each other's hidden reasoning, so a switch may cost a
+  summarized rollover; keep long investigations on one provider when you can.
 - Change the model fallbacks with `AZURE_OPENAI_FALLBACK_DEPLOYMENTS` and
   `OPENAI_FALLBACK_MODELS`; `none` disables them.
 

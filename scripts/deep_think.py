@@ -156,6 +156,20 @@ ENV_FILE_LINE = re.compile(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)")
 SECRET_FRAGMENT_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_*-]+")
 # Env-file names are echoed in errors only when they look like variable names.
 ENV_NAME_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+# A missing deployment or model moves to the next model instead of stopping.
+MISSING_MODEL_CODES = frozenset({"DeploymentNotFound", "model_not_found"})
+SERVICE_LABELS = {"azure": "Azure", "openai": "OpenAI"}
+# Journal fields used as identifiers or destinations must be strings or null.
+JOURNAL_TEXT_FIELDS = (
+    "event",
+    "attempt_id",
+    "turn_id",
+    "lock_id",
+    "response_id",
+    "resource",
+    "provider",
+    "deployment",
+)
 
 
 class DeepThinkError(RuntimeError):
@@ -407,7 +421,7 @@ def _status_error_details(error):
     body = getattr(error, "body", None)
     details = body.get("error", body) if isinstance(body, dict) else {}
     code = details.get("code") or details.get("type")
-    message = details.get("message") or str(error)
+    message = _redact_secrets(details.get("message") or str(error))
     return status_code, code, message
 
 
@@ -641,6 +655,7 @@ def create_client(
             api_key=api_key.strip(),
             max_retries=0,
             timeout=DEFAULT_REQUEST_TIMEOUT,
+            **_sdk_options(openai_factory),
         )
     if not isinstance(endpoint, str) or not endpoint.strip():
         raise DeepThinkError(
@@ -677,6 +692,7 @@ def create_client(
         client_options["default_query"] = {"api-version": query[0][1]}
 
     normalized_endpoint = endpoint.rstrip("/") + "/"
+    client_options.update(_sdk_options(openai_factory))
     if auth == "azure-key":
         # An empty SDK key suppresses the Authorization header, so Azure sees
         # only its documented api-key header.
@@ -691,17 +707,12 @@ def create_client(
             )
         )
 
-    if (
-        credential_factory is None
-        or token_provider_factory is None
-        or openai_factory is None
-    ):
+    if credential_factory is None or token_provider_factory is None:
         try:
             from azure.identity import (
                 DefaultAzureCredential,
                 get_bearer_token_provider,
             )
-            from openai import OpenAI
         except ImportError as error:
             raise DeepThinkError(
                 "Install dependencies with: "
@@ -713,7 +724,7 @@ def create_client(
             )
         )
         token_provider_factory = token_provider_factory or get_bearer_token_provider
-        openai_factory = openai_factory or OpenAI
+    openai_factory = openai_factory or _import_openai()
 
     token_provider = token_provider_factory(
         credential_factory(),
@@ -728,6 +739,20 @@ def create_client(
             **client_options,
         )
     )
+
+
+def _sdk_options(openai_factory):
+    """Production clients refuse redirects, so headers never reach another host."""
+    if openai_factory is not None:
+        return {}
+    try:
+        from openai import DefaultHttpxClient
+    except ImportError as error:
+        raise DeepThinkError(
+            "Install dependencies with: python -m pip install --upgrade openai"
+        ) from error
+    # The Responses API never redirects; httpx would forward api-key headers.
+    return {"http_client": DefaultHttpxClient(follow_redirects=False)}
 
 
 def _without_openai_account(client):
@@ -844,10 +869,11 @@ def create_routed_client(
 
 def _is_sign_in_failure(error):
     """True when the service refused a call because sign-in failed."""
-    return _is_credential_error(error) or getattr(error, "status_code", None) in {
-        401,
-        403,
-    }
+    if _is_credential_error(error):
+        return True
+    status_code, code, _message = _status_error_details(error)
+    # OpenAI reports a model the project cannot use as 403 model_not_found.
+    return status_code in {401, 403} and code not in MISSING_MODEL_CODES
 
 
 class AuthFallbackClient:
@@ -967,19 +993,21 @@ def _is_credential_error(error):
     return isinstance(error, ClientAuthenticationError)
 
 
-def _classify_submission_error(error, connection_error, validation_error, status_error):
+def _classify_submission_error(
+    error, connection_error, validation_error, status_error, service="Azure"
+):
     if isinstance(error, status_error):
         status_code, code, message = _status_error_details(error)
         if status_code in AMBIGUOUS_HTTP_STATUS_CODES:
             return SubmissionFailure(
                 "unknown",
-                f"gateway HTTP {status_code}; Azure may have accepted the request",
+                f"gateway HTTP {status_code}; {service} may have accepted the request",
                 http_status=status_code,
                 code=code,
             )
         return SubmissionFailure(
             "rejected",
-            f"Azure HTTP {status_code}",
+            f"{service} HTTP {status_code}",
             http_status=status_code,
             code=code,
             message=message,
@@ -994,7 +1022,7 @@ def _classify_submission_error(error, connection_error, validation_error, status
                 response_id=response_id,
             )
         return SubmissionFailure(
-            "unknown", "Azure returned a success response without a readable ID"
+            "unknown", f"{service} returned a success response without a readable ID"
         )
     if isinstance(error, connection_error):
         cause = error.__cause__
@@ -1043,15 +1071,21 @@ def _record_accepted(journal, attempt_id, response_id, status):
 
 
 def _submission_unknown_message(purpose, target, attempt_id, reason):
+    if getattr(target, "provider", "azure") == "openai":
+        where = (
+            "OpenAI may already be running this request. Find it in the OpenAI "
+            "dashboard logs"
+        )
+    else:
+        where = "Azure may already be running this request. Find it in Azure telemetry"
     return (
         f"{purpose.capitalize()} submission outcome is unknown (attempt "
         f"{attempt_id}, deployment {target.deployment}, resource "
         f"{target.resource or 'configured client'}): {reason}. No replacement "
-        "request was sent: Azure documents no idempotency key for Responses, so "
-        "Azure may already be running this request. Find it in Azure telemetry and "
-        "run `reconcile --attempt ATTEMPT --response-id ID`, or, after verifying "
-        "that no job remains active, run `reconcile --confirm-no-remote-job "
-        "--reason TEXT`."
+        "request was sent: the Responses API has no idempotency key, so "
+        f"{where} and run `reconcile --attempt ATTEMPT --response-id ID`, or, "
+        "after verifying that no job remains active, run `reconcile "
+        "--confirm-no-remote-job --reason TEXT`."
     )
 
 
@@ -1071,6 +1105,7 @@ def _poll_background_response(
     on_retry,
     on_status=None,
     initial_wait=True,
+    service="Azure",
 ):
     try:
         from openai import (
@@ -1118,14 +1153,14 @@ def _poll_background_response(
                     timeout=min(DEFAULT_REQUEST_TIMEOUT, remaining()),
                 )
             except APIResponseValidationError as error:
-                reason = "malformed Azure response"
+                reason = f"malformed {service} response"
                 retry_error = error
             except APIConnectionError as error:
                 reason = type(error).__name__
                 retry_error = error
             except APIStatusError as error:
                 status_code, code, message = _status_error_details(error)
-                reason = f"Azure HTTP {status_code}"
+                reason = f"{service} HTTP {status_code}"
                 if code:
                     reason += f" ({code})"
                 if not _status_error_is_retryable(error):
@@ -1143,7 +1178,7 @@ def _poll_background_response(
                             "Background response ID changed while polling."
                         )
                 except MalformedResponseError as error:
-                    reason = "malformed Azure response"
+                    reason = f"malformed {service} response"
                     retry_error = error
                 else:
                     response = retrieved
@@ -1282,10 +1317,11 @@ def _request_response(
         sleep(delay)
 
     def switch_provider(reason):
-        """After a sign-in failure, move to the next provider's chain if listed."""
+        """After a sign-in failure, move to another listed provider's chain."""
         nonlocal deployment_index
         failed = targets[deployment_index].provider
-        for index in range(deployment_index + 1, len(targets)):
+        for step in range(1, len(targets)):
+            index = (deployment_index + step) % len(targets)
             if (
                 targets[index].provider != failed
                 and targets[index].provider not in signed_out
@@ -1347,6 +1383,7 @@ def _request_response(
                     APIConnectionError,
                     APIResponseValidationError,
                     APIStatusError,
+                    SERVICE_LABELS.get(active.provider, "Azure"),
                 )
                 if failure.kind == "unknown":
                     if not isinstance(error, Exception):
@@ -1407,7 +1444,10 @@ def _request_response(
                         failure.code,
                         failure.message,
                     )
-                    reason = f"Azure HTTP {status_code}"
+                    reason = (
+                        f"{SERVICE_LABELS.get(active.provider, 'Azure')} HTTP "
+                        f"{status_code}"
+                    )
                     if code:
                         reason += f" ({code})"
                     if _status_error_is_opaque_replay(
@@ -1422,10 +1462,9 @@ def _request_response(
                             f"{purpose.capitalize()} request exceeded the context "
                             f"limit: {reason}: {message}"
                         ) from error
-                    deployment_missing = status_code == 404 and code in {
-                        "DeploymentNotFound",
-                        "model_not_found",
-                    }
+                    deployment_missing = (
+                        status_code in {403, 404} and code in MISSING_MODEL_CODES
+                    )
                     if not (_status_error_is_retryable(error) or deployment_missing):
                         if (
                             status_code in {401, 403}
@@ -1477,6 +1516,7 @@ def _request_response(
                 poll_interval=poll_interval,
                 poll_timeout=poll_timeout,
                 target_label=target_label,
+                service=SERVICE_LABELS.get(active.provider, "Azure"),
                 sleep=sleep,
                 random_value=random_value,
                 on_retry=on_retry,
@@ -1490,7 +1530,7 @@ def _request_response(
                 "poll_stopped",
                 attempt_id=attempt_id,
                 response_id=response_id,
-                reason=f"{type(error).__name__}: {error}",
+                reason=_redact_secrets(f"{type(error).__name__}: {error}"),
             )
             if isinstance(error, Exception) and _is_credential_error(error):
                 raise DeepThinkError(
@@ -2196,6 +2236,14 @@ def _read_journal(path):
                     f"Request journal {path} line {number} has an invalid "
                     f"artifact name in {field!r}: {name!r}. The journal may have "
                     "been tampered with; inspect it before continuing."
+                )
+        for field in JOURNAL_TEXT_FIELDS:
+            value = record.get(field)
+            if value is not None and not isinstance(value, str):
+                raise DeepThinkError(
+                    f"Request journal {path} line {number} has an invalid "
+                    f"{field!r} value. The journal may have been tampered with; "
+                    "inspect it before continuing."
                 )
         records.append(record)
     return records, torn_tail
@@ -4308,28 +4356,38 @@ def _api_errors():
     return APIConnectionError, APIStatusError
 
 
-def _remote_call(client_factory, clients, resource, operation, response_id):
-    """Run one retrieve/cancel call; return (kind, response or message)."""
+def _remote_call(
+    client_factory, clients, resource, operation, response_id, service="Azure"
+):
+    """Run one retrieve/cancel call; return (kind, response or message).
+
+    Errors are returned rather than raised, so one job's failure (a refused
+    endpoint, a missing credential, or a failed sign-in) never stops recovery
+    of the others. Nothing is sent when the client cannot be built.
+    """
     connection_error, status_error = _api_errors()
     try:
         if resource not in clients:
             clients[resource] = client_factory(resource)
         response = getattr(clients[resource].responses, operation)(response_id)
+    except DeepThinkError as error:
+        return "error", _redact_secrets(error)
     except status_error as error:
         status_code, _code, message = _status_error_details(error)
         if status_code == 404:
-            return "not_found", f"Azure HTTP 404: {message}"
-        return "error", f"Azure HTTP {status_code}: {message}"
+            return "not_found", f"{service} HTTP 404: {message}"
+        return "error", f"{service} HTTP {status_code}: {message}"
     except connection_error as error:
         return "error", f"{type(error).__name__}: {error}"
     except Exception as error:
         # The SDK fetches Entra tokens before its transport error handling.
         if _is_credential_error(error):
-            raise DeepThinkError(
-                f"Azure authentication failed while calling {operation} for "
-                f"{response_id}: {error} Fix authentication (for example, "
-                "`az login`) and retry; no remote state was changed by this call."
-            ) from error
+            return "error", (
+                f"{service} authentication failed while calling {operation} for "
+                f"{response_id}: {_redact_secrets(error)} Fix authentication (for "
+                "example, `az login`) and retry; no remote state was changed by "
+                "this call."
+            )
         raise
     return "response", response
 
@@ -4390,13 +4448,23 @@ def cancel_requests(
                 else {}
             )
             kind, value = _remote_call(
-                factory, owner_clients, resource, "cancel", response_id
+                factory,
+                owner_clients,
+                resource,
+                "cancel",
+                response_id,
+                SERVICE_LABELS.get(owner, "Azure"),
             )
             if kind == "error" and attempt is not None:
                 # Azure rejects cancelling finished jobs (HTTP 400), so record
                 # the job's actual state instead of leaving it marked active.
                 observed_kind, observed = _remote_call(
-                    factory, owner_clients, resource, "retrieve", response_id
+                    factory,
+                    owner_clients,
+                    resource,
+                    "retrieve",
+                    response_id,
+                    SERVICE_LABELS.get(owner, "Azure"),
                 )
                 if observed_kind == "response":
                     status, note = _record_observed_response(journal, attempt, observed)
@@ -4516,6 +4584,7 @@ def _refresh_active_attempts(journal, factories, clients, actions):
             attempt["resource"],
             "retrieve",
             response_id,
+            SERVICE_LABELS.get(owner, "Azure"),
         )
         if kind == "not_found":
             actions.append(_record_not_found(journal, attempt, response_id))
@@ -4606,6 +4675,7 @@ def reconcile_project(
                     endpoint,
                     "retrieve",
                     response_id,
+                    SERVICE_LABELS.get(first_provider, "Azure"),
                 )
                 status = _safe_response_status(value) if kind == "response" else None
                 journal.append(
@@ -4926,14 +4996,16 @@ def _method_client_factory(method):
     return factory
 
 
-def _configured_client_factories(methods, *, on_switch=None):
+def _configured_client_factories(methods, *, on_switch=None, on_unavailable=None):
     """Return one client factory per provider, ordered by first use in methods.
 
     Several methods for one provider become an AuthFallbackClient that tries
-    them in order on the same resource. A backup method without a credential
-    for a resource (such as a per-resource key) is skipped for that resource.
+    them in order on the same resource. A method that cannot build a client
+    for a resource (such as a missing per-resource key, or azure-identity not
+    installed) is skipped there; the request fails only if no method remains.
     """
     factories = {}
+    reported = set()
     for provider in _method_providers(methods):
         builders = [
             (method, _method_client_factory(method))
@@ -4945,14 +5017,20 @@ def _configured_client_factories(methods, *, on_switch=None):
             continue
 
         def factory(resource, builders=builders):
-            clients, missing = [], None
+            clients, failures = [], []
             for method, build in builders:
                 try:
                     clients.append((method, build(resource)))
-                except MissingCredentialError as error:
-                    missing = missing or error
+                except DeepThinkError as error:
+                    failures.append((method, error))
             if not clients:
-                raise missing
+                raise failures[0][1]
+            for method, error in failures:
+                expected = isinstance(error, MissingCredentialError)
+                if not expected and method not in reported:
+                    reported.add(method)
+                    if on_unavailable is not None:
+                        on_unavailable(method, error)
             if len(clients) == 1:
                 return clients[0][1]
             return AuthFallbackClient(clients, on_switch=on_switch)
@@ -5030,15 +5108,18 @@ def _provider_router(args, deployment, provider, client_factory, endpoint):
     backup_endpoint = args.backup_endpoint or (
         None if legacy_deployment else os.getenv("AZURE_OPENAI_GPT6_BACKUP_ENDPOINT")
     )
+    # The GPT-6 backup deployment name applies only to the configured GPT-6
+    # primary, so an explicit other model is never answered by GPT-6.
+    configured_primary = os.getenv("AZURE_OPENAI_DEPLOYMENT") or DEFAULT_DEPLOYMENT
     return create_routed_client(
         primary,
         deployment,
         backup_endpoint=backup_endpoint,
         backup_deployment=args.backup_deployment
         or (
-            None
-            if legacy_deployment
-            else os.getenv("AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT")
+            os.getenv("AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT")
+            if deployment == configured_primary and not legacy_deployment
+            else None
         ),
         fallback_endpoint=args.fallback_endpoint,
         client_factory=client_factory,
@@ -5105,20 +5186,30 @@ def _trusted_client_factory(client_factory, args, provider):
     other = "azure" if provider == "openai" else "openai"
     trusted = {_endpoint_key(value) for value in configured if value}
     # Endpoints configured for the other provider are never trusted here, even
-    # when passed explicitly, unless their host plainly belongs to this one.
+    # when passed explicitly, unless their host plainly belongs to this one or
+    # this provider's own settings configure them too.
     if other == "openai":
         foreign = [os.getenv("OPENAI_BASE_URL")]
+        own = [os.getenv(name) for name in CONFIGURED_ENDPOINT_VARIABLES]
     else:
         foreign = [os.getenv(name) for name in CONFIGURED_ENDPOINT_VARIABLES]
+        own = [os.getenv("OPENAI_BASE_URL")]
+    own = {_endpoint_key(value) for value in own if value}
     foreign = {
         _endpoint_key(value)
         for value in foreign
         if value and _owner_or_none(value) != provider
-    }
+    } - own
     single = f"--auth {PROVIDER_AUTH_HINTS[provider]}"
 
     def factory(resource):
-        # Journal resources may be tampered with; None carries no destination.
+        # Journal resources may be tampered with. For Azure, None carries no
+        # destination; an OpenAI client would default to api.openai.com.
+        if resource is None and provider == "openai":
+            raise DeepThinkError(
+                "The recorded OpenAI response has no resource, so credentials "
+                "will not be sent; the journal may have been tampered with."
+            )
         if resource is not None:
             key = _endpoint_key(resource) if isinstance(resource, str) else None
             if key is not None and key in foreign:
@@ -5149,7 +5240,8 @@ def default_env_file(environ=None):
     """Return the per-user env file path, or None when no home is known."""
     environ = os.environ if environ is None else environ
     config_home = environ.get("XDG_CONFIG_HOME")
-    if config_home:
+    # The XDG spec says to ignore relative values.
+    if config_home and Path(config_home).is_absolute():
         return Path(config_home) / "deep-think" / ".env"
     try:
         return Path.home() / ".config" / "deep-think" / ".env"
@@ -5182,6 +5274,8 @@ def _parse_env_file(text, label):
             value = value[1:end]
         else:
             value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        if "\x00" in value:
+            raise DeepThinkError(f"{where}: {name} contains a NUL character.")
         settings[name] = value
     return settings
 
@@ -5224,7 +5318,7 @@ def cli(argv=None):
     try:
         load_env_file()
     except DeepThinkError as error:
-        sys.stderr.write(f"deep-think: {error}\n")
+        sys.stderr.write(f"deep-think: {_redact_secrets(error)}\n")
         return 2
     return main(argv)
 
@@ -5257,6 +5351,12 @@ def main(
             f"({type(error).__name__}); using {METHOD_LABELS[current]}.\n"
         )
 
+    def report_unavailable(method, error):
+        stderr.write(
+            f"deep-think: {METHOD_LABELS[method]} is unavailable "
+            f"({_redact_secrets(error)}); using the other listed sign-in methods.\n"
+        )
+
     try:
         if args.command != "status":
             methods = _resolve_methods(args)
@@ -5268,7 +5368,9 @@ def main(
                 )
             if client_factory is create_client:
                 factories = _configured_client_factories(
-                    methods, on_switch=report_switch
+                    methods,
+                    on_switch=report_switch,
+                    on_unavailable=report_unavailable,
                 )
             else:
                 factories = dict.fromkeys(_method_providers(methods), client_factory)
@@ -5332,7 +5434,7 @@ def main(
                 upgradable_deployments=_upgradable_deployments(),
             )
     except DeepThinkError as error:
-        stderr.write(f"deep-think: {error}\n")
+        stderr.write(f"deep-think: {_redact_secrets(error)}\n")
         if args.command in {"ask", "resume"}:
             stderr.write(
                 "deep-think: inspect recovery state with "

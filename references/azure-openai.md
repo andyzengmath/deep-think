@@ -72,8 +72,9 @@ By default, make one submission attempt per routed model, and at least five
   response leaves the retry loop.
 - Empty completed responses.
 - HTTP 408, 409, 429, and non-gateway 5xx responses.
-- Submission-level HTTP 404 with exact code `DeploymentNotFound` (Azure) or
-  `model_not_found` (OpenAI).
+- Submission-level HTTP 404 with exact code `DeploymentNotFound` (Azure), or
+  HTTP 403/404 with code `model_not_found` (OpenAI, including a project without
+  access to the model).
 - Azure `server_error`, `too_many_requests`, `rate_limit_exceeded`,
   `no_capacity`, `timeout`, and `temporarily_unavailable` response codes.
 
@@ -125,10 +126,13 @@ Honor `x-should-retry`, `Retry-After`, and `retry-after-ms`, except that HTTP
 failover and same-ID polling recovery cannot be disabled. Otherwise use
 exponential backoff with bounded jitter. Never retry refusals, ordinary bad
 requests, or other permanent 4xx errors, even when `x-should-retry` is `true`.
-Sign-in failures (a credential error, or HTTP 401/403) are not retried on the
-same method; they move to the next listed `--auth` method or provider, and are
-otherwise terminal. The exact submission-level `DeploymentNotFound` and
-`model_not_found` 404s are target-specific and allow failover.
+Sign-in failures (a credential error, or HTTP 401/403 other than
+`model_not_found`) are not retried on the same method; they move to the next
+listed `--auth` method, then to another listed provider that has not failed
+sign-in (wrapping around), and are otherwise terminal. The exact
+submission-level `DeploymentNotFound` 404 and `model_not_found` 403/404 are
+target-specific and allow failover. Clients never follow HTTP redirects, so
+headers such as `api-key` cannot be forwarded to another host.
 Persist only the final complete response.
 
 ## Context policy
@@ -140,7 +144,8 @@ window and count as output tokens.
 The GPT-6 upgrade retains these local budgets rather than assuming a larger
 context window. GPT-6-specific limits are not independently established here;
 service-side context errors still follow the bounded recovery policy.
-Existing projects on built-in older deployments can adopt the new default:
+Existing projects whose primary is a default or configured fallback deployment
+can adopt the new default:
 verify state and file checksums first, retain all history, record the primary
 upgrade, and persist it only through the ordinary successful-turn commit.
 When service-error recovery is explicitly enabled, a completed rollover is
@@ -250,8 +255,12 @@ HTTP 400 ("Cannot cancel a completed response") for finished jobs, so retrieve
 the job after a failed cancel and record its actual state, caching completed
 output for `resume`. `reconcile`
 retrieves each active ID once, records terminal states, caches completed
-results for `resume`, and treats HTTP 404 on the journaled original resource as
-no longer running. An operator-attached ID must use the attempt's recorded
+results for `resume`, and treats HTTP 404 on the journaled original Azure
+resource as no longer running. For OpenAI, a 404 cannot distinguish a deleted
+response from one owned by another project, so the attempt becomes unknown
+(`remote_not_visible`) instead. A refused endpoint, missing credential, or
+failed sign-in is reported for that job alone; the other jobs are still
+processed. An operator-attached ID must use the attempt's recorded
 resource; if it returns 404 before any successful observation, the attachment
 is rejected and the submission stays unknown. Background responses with
 `store=false` are retained for roughly 10 minutes after completion, so later

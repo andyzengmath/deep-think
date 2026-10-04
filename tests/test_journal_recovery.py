@@ -992,7 +992,7 @@ class ReviewRegressionTests(ProjectFixture):
         self.seed()
         self.start_active_job()
         broken = CancelClient(
-            retrieved=[ClientAuthenticationError("az login required")],
+            retrieved=[ClientAuthenticationError("az login required")] * 2,
             cancelled=[ClientAuthenticationError("az login required")],
         )
         for command in ("reconcile", "cancel"):
@@ -1003,8 +1003,13 @@ class ReviewRegressionTests(ProjectFixture):
                 stdout=stdout,
                 stderr=stderr,
             )
-            self.assertEqual(code, 2, command)
-            self.assertIn("authentication", stderr.getvalue())
+            # The failure is reported for the job; nothing else is changed.
+            self.assertEqual(code, 0, command)
+            self.assertIn("authentication failed", stdout.getvalue())
+            self.assertIn("no remote state was changed", stdout.getvalue())
+        self.assertEqual(
+            [item["state"] for item in self.status()["outstanding"]], ["active"]
+        )
 
     def seed_small_budget(self):
         self.runner.run_turn(
@@ -1271,10 +1276,17 @@ class JournalTrustTests(ProjectFixture):
             "AZURE_OPENAI_GPT6_ENDPOINT": "https://primary.example/openai/v1/"
         }
         with mock.patch.dict("os.environ", configured, clear=True):
-            for command in ("cancel", "reconcile", "resume"):
-                code, _, stderr = self.cli(command, client_factory=factory)
-                self.assertEqual(code, 2, command)
-                self.assertIn("not a configured endpoint", stderr)
+            # Recovery commands report the refusal per job; resume stops.
+            code, output, stderr = self.cli("cancel", client_factory=factory)
+            self.assertEqual(code, 0, stderr)
+            [result] = json.loads(output)["results"]
+            self.assertIn("not a configured endpoint", result["error"])
+            code, output, stderr = self.cli("reconcile", client_factory=factory)
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("not a configured endpoint", output)
+            code, _, stderr = self.cli("resume", client_factory=factory)
+            self.assertEqual(code, 2)
+            self.assertIn("not a configured endpoint", stderr)
             self.assertNotIn(recorded, requested)
 
             code, output, stderr = self.cli(
