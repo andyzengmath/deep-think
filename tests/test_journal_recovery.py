@@ -9,6 +9,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from test_deep_think import (
     FakeClient,
@@ -1134,6 +1135,154 @@ class ReviewRegressionTests(ProjectFixture):
             self.ask(second, recover_service_errors=True, max_attempts=1)
         self.assertEqual(len(second.responses.calls), 1)
         self.assertEqual(self.state()["volume"], 2)
+
+
+class JournalTrustTests(ProjectFixture):
+    """A journal may arrive through a shared repository, so treat it as input."""
+
+    def forge(self, **fields):
+        record = {
+            "schema": "deep-think-request-journal/v1",
+            "recorded_at": "2026-10-04T00:00:00+00:00",
+            "lock_id": None,
+            **fields,
+        }
+        path = self.project_dir / "requests" / "journal.jsonl"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record) + "\n")
+
+    def cli(self, *arguments, client_factory):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = self.runner.main(
+            [arguments[0], "--project", self.project, "--root", str(self.root)]
+            + list(arguments[1:]),
+            client_factory=client_factory,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_tampered_artifact_names_cannot_reach_outside_requests(self):
+        for traversal in (True, False):
+            self.tearDown()
+            self.setUp()
+            victim = self.root / "victim.txt"
+            name = "../../victim.txt" if traversal else str(victim)
+            with self.subTest(name=name):
+                victim.write_text("keep", "utf-8")
+                self.seed()
+                self.forge(
+                    event="turn_started",
+                    turn_id="forged",
+                    prompt_sha256="0" * 64,
+                    prompt_file=name,
+                    base_state_sha256=None,
+                    deployment="gpt-6-astra",
+                )
+                self.forge(
+                    event="submitting",
+                    turn_id="forged",
+                    attempt_id="forged-attempt",
+                    logical_sha256="1" * 64,
+                    deployment="gpt-6-astra",
+                    resource=None,
+                )
+                self.forge(
+                    event="completed",
+                    turn_id="forged",
+                    attempt_id="forged-attempt",
+                    response_id="resp-forged",
+                    payload=name,
+                    payload_sha256="0" * 64,
+                )
+                client = FakeClient([FakeResponse("resp-unused", "Must not run.")])
+                with self.assertRaisesRegex(
+                    self.runner.DeepThinkError, "artifact name"
+                ):
+                    self.status()
+                with self.assertRaisesRegex(
+                    self.runner.DeepThinkError, "artifact name"
+                ):
+                    self.runner.reconcile_project(
+                        lambda _resource: FakeClient([]),
+                        root=self.root,
+                        project=self.project,
+                        abandon_turn=True,
+                        reason="Cleanup.",
+                    )
+                with self.assertRaisesRegex(
+                    self.runner.DeepThinkError, "artifact name"
+                ):
+                    self.ask(client)
+                self.assertTrue(victim.exists())
+                self.assertEqual(client.responses.calls, [])
+
+    def test_artifact_paths_accept_only_bare_journal_names(self):
+        journal = self.runner.RequestJournal(self.project_dir)
+        for name in (
+            "resp_0a1-B.json",
+            "a" * 32 + ".prompt.txt",
+            "b" * 32 + ".response.json",
+        ):
+            self.assertEqual(journal._artifact_path(name).parent, journal.directory)
+        for name in (
+            "../x.json",
+            "..\\x.json",
+            "C:\\x.json",
+            "/x.json",
+            "x/y.json",
+            ".json",
+            "",
+            None,
+        ):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(self.runner.DeepThinkError, "artifact name"),
+            ):
+                journal._artifact_path(name)
+
+    def test_cli_sends_credentials_only_to_configured_endpoints(self):
+        self.seed()
+        recorded = "https://unconfigured.example/openai/v1/"
+        router = self.runner.create_routed_client(
+            recorded,
+            "gpt-6-astra",
+            client_factory=lambda _resource: FakeClient(
+                [FakeResponse("resp-job", "", status="queued", incomplete_reason=None)],
+                [make_status_error(401, "unauthorized")],
+            ),
+        )
+        with self.assertRaisesRegex(self.runner.DeepThinkError, "resp-job"):
+            self.ask(router)
+        requested = []
+
+        def factory(resource):
+            requested.append(resource)
+            return CancelClient(
+                retrieved=[FakeResponse("resp-job", "", status="in_progress")],
+                cancelled=[
+                    FakeResponse(
+                        "resp-job", "", status="cancelled", incomplete_reason=None
+                    )
+                ],
+            )
+
+        configured = {
+            "AZURE_OPENAI_GPT6_ENDPOINT": "https://primary.example/openai/v1/"
+        }
+        with mock.patch.dict("os.environ", configured, clear=True):
+            for command in ("cancel", "reconcile", "resume"):
+                code, _, stderr = self.cli(command, client_factory=factory)
+                self.assertEqual(code, 2, command)
+                self.assertIn("not a configured endpoint", stderr)
+            self.assertNotIn(recorded, requested)
+
+            code, output, stderr = self.cli(
+                "cancel", "--endpoint", recorded, client_factory=factory
+            )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(requested[-1], recorded)
+        self.assertEqual(json.loads(output)["results"][0]["status"], "cancelled")
 
 
 if __name__ == "__main__":

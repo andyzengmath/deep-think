@@ -118,6 +118,16 @@ TERMINAL_RESPONSE_STATUSES = frozenset(
 AMBIGUOUS_HTTP_STATUS_CODES = frozenset({502, 504})
 OUTSTANDING_ATTEMPT_STATES = frozenset({"active", "unknown", "in_flight"})
 RESPONSE_FILENAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
+# Every artifact the runner writes under requests/ has one of these bare names.
+ARTIFACT_NAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9_-]{1,200}(?:\.response\.json|\.json|\.prompt\.txt)$"
+)
+CONFIGURED_ENDPOINT_VARIABLES = (
+    "AZURE_OPENAI_GPT6_ENDPOINT",
+    "AZURE_OPENAI_GPT6_BACKUP_ENDPOINT",
+    "AZURE_OPENAI_FALLBACK_ENDPOINT",
+    "AZURE_OPENAI_ENDPOINT",
+)
 
 
 class DeepThinkError(RuntimeError):
@@ -1872,8 +1882,20 @@ def _read_journal(path):
                 f"Request journal {path} line {number} is corrupt: unexpected "
                 "record format."
             )
+        for field in ("payload", "prompt_file"):
+            name = record.get(field)
+            if name is not None and not _is_artifact_name(name):
+                raise DeepThinkError(
+                    f"Request journal {path} line {number} has an invalid "
+                    f"artifact name in {field!r}: {name!r}. The journal may have "
+                    "been tampered with; inspect it before continuing."
+                )
         records.append(record)
     return records, torn_tail
+
+
+def _is_artifact_name(name):
+    return isinstance(name, str) and ARTIFACT_NAME_PATTERN.fullmatch(name) is not None
 
 
 ATTEMPT_RECORD_FIELDS = (
@@ -2316,7 +2338,7 @@ class RequestJournal:
         )
         text = _json_text(payload)
         try:
-            _atomic_write_text(self.directory / name, text)
+            _atomic_write_text(self._artifact_path(name), text)
         except DeepThinkError as error:
             raise DeepThinkError(
                 f"Response {response_id} completed, but the request journal could "
@@ -2330,9 +2352,23 @@ class RequestJournal:
             payload_sha256=_sha256_text(text),
         )
 
+    def _artifact_path(self, name):
+        # Names come from the journal, which may be shared; never escape it.
+        if not _is_artifact_name(name):
+            raise DeepThinkError(
+                f"Request journal contains an invalid artifact name: {name!r}"
+            )
+        path = self.directory / name
+        if path.resolve().parent != self.directory.resolve():
+            raise DeepThinkError(
+                f"Request journal artifact name escapes {self.directory}: {name!r}"
+            )
+        return path
+
     def load_completion(self, attempt):
+        path = self._artifact_path(attempt["payload"])
         try:
-            text = (self.directory / attempt["payload"]).read_bytes().decode("utf-8")
+            text = path.read_bytes().decode("utf-8")
             if _sha256_text(text) != attempt["payload_sha256"]:
                 return None
             response = CachedResponse(json.loads(text))
@@ -2348,7 +2384,7 @@ class RequestJournal:
     def save_prompt(self, turn_id, prompt):
         name = f"{turn_id}.prompt.txt"
         try:
-            _atomic_write_text(self.directory / name, prompt)
+            _atomic_write_text(self._artifact_path(name), prompt)
         except DeepThinkError as error:
             raise DeepThinkError(
                 f"Could not record the turn prompt in the request journal: {error}"
@@ -2356,12 +2392,9 @@ class RequestJournal:
         return name
 
     def read_prompt(self, turn):
+        path = self._artifact_path(turn["prompt_file"])
         try:
-            prompt = (
-                (self.directory / (turn["prompt_file"] or ""))
-                .read_bytes()
-                .decode("utf-8")
-            )
+            prompt = path.read_bytes().decode("utf-8")
         except (OSError, UnicodeError) as error:
             raise DeepThinkError(
                 f"The unfinished turn's journaled prompt is unavailable: {error}"
@@ -2375,8 +2408,9 @@ class RequestJournal:
     def release_payloads(self, turn_id):
         for attempt in self.view().turn_attempts(turn_id):
             if attempt["payload"]:
+                path = self._artifact_path(attempt["payload"])
                 try:
-                    (self.directory / attempt["payload"]).unlink()
+                    path.unlink()
                 except OSError:
                     pass
 
@@ -2384,8 +2418,9 @@ class RequestJournal:
         self.release_payloads(turn_id)
         turn = self.view().turns.get(turn_id)
         if turn is not None and turn["prompt_file"]:
+            path = self._artifact_path(turn["prompt_file"])
             try:
-                (self.directory / turn["prompt_file"]).unlink()
+                path.unlink()
             except OSError:
                 pass
 
@@ -4460,6 +4495,35 @@ def _router_from_args(args, deployment, client_factory):
     )
 
 
+def _endpoint_key(endpoint):
+    return endpoint.strip().rstrip("/")
+
+
+def _trusted_client_factory(client_factory, args):
+    """Send Entra tokens only to endpoints configured for this invocation."""
+    configured = [os.getenv(name) for name in CONFIGURED_ENDPOINT_VARIABLES]
+    configured += [
+        getattr(args, option, None)
+        for option in ("endpoint", "backup_endpoint", "fallback_endpoint")
+    ]
+    trusted = {_endpoint_key(value) for value in configured if value}
+
+    def factory(resource):
+        # Journal resources may be tampered with; None carries no destination.
+        if resource is not None and (
+            not isinstance(resource, str) or _endpoint_key(resource) not in trusted
+        ):
+            raise DeepThinkError(
+                f"Recorded resource {resource!r} is not a configured endpoint, so "
+                "Azure credentials will not be sent to it. If it is legitimate, "
+                "pass it explicitly with --endpoint (for resume: --endpoint, "
+                "--backup-endpoint, or --fallback-endpoint)."
+            )
+        return client_factory(resource)
+
+    return factory
+
+
 def main(
     argv=None,
     *,
@@ -4474,6 +4538,7 @@ def main(
     if hasattr(stdout, "reconfigure"):
         stdout.reconfigure(encoding="utf-8")
     args = _build_parser().parse_args(argv)
+    client_factory = _trusted_client_factory(client_factory, args)
 
     def report_retry(event):
         stderr.write(

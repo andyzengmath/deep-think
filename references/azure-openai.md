@@ -190,6 +190,14 @@ Keep local writer state separate from remote request state:
 - A dead writer does not prove its Azure job ended. Attempts with an intent but
   no outcome become `submission_unknown` when their stale lock is recovered. A
   stale pre-journal lock is recorded as an unresolved unknown writer.
+- Treat the journal as untrusted input; it may arrive through a shared
+  repository. Accept only the bare artifact names the runner writes
+  (`<response-id>.json`, `<attempt-id>.response.json`, `<turn-id>.prompt.txt`)
+  and require each resolved path to stay directly inside `requests/`; any other
+  name marks the journal as corrupt. The CLI sends Entra tokens only to
+  endpoints configured for the invocation (the GPT-6, backup, and fallback
+  endpoint variables, `AZURE_OPENAI_ENDPOINT`, or explicit endpoint options);
+  it refuses any other recorded resource.
 
 Each turn journals its prompt, deployment, and starting state digest. Re-running
 the identical prompt, or `resume`, continues that turn: a matching request

@@ -222,6 +222,13 @@ When installed as a repository skill, prefix paths with
   TEXT` once you have verified that no job remains active.
 - **Unfinished turn blocks a new prompt:** run `resume` to finish it, `cancel`
   to stop running jobs, or `reconcile --abandon-turn --reason TEXT`.
+- **Recorded resource is not a configured endpoint:** the journal names an
+  endpoint that is not configured for this run, so the runner will not send
+  Azure credentials to it. If that endpoint is legitimate (for example, you
+  changed configuration while a job ran), pass it explicitly with `--endpoint`.
+- **Request journal has an invalid artifact name:** the journal names a file
+  outside its `requests` directory and may have been tampered with. Inspect it
+  before continuing; the runner will not read or delete such paths.
 - **Old model still selected:** clear an old `AZURE_OPENAI_DEPLOYMENT`
   override or set it to `gpt-6-astra`, then restart the terminal/agent.
 - **Credential chain selects the wrong account:** inspect `az account show`,

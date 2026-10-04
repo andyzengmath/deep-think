@@ -198,7 +198,11 @@ lock or journal by hand. Background responses stored with `store=false` are
 retained only briefly after completion, so resume promptly; an HTTP 404 on the
 original resource is recorded as no longer running, and its output is lost. The
 journal contains prompts and resource endpoint names but no credentials; review
-it before committing, as with transcripts.
+it before committing, as with transcripts. Treat journals from other people as
+untrusted: the runner rejects artifact names that would leave `requests\` and
+sends credentials only to configured endpoints. After changing endpoint
+configuration, pass an old recorded endpoint explicitly with `--endpoint` to
+resume, cancel, or reconcile its job.
 
 ## Continue rigorously
 
