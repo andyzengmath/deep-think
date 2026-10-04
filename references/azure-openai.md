@@ -4,30 +4,37 @@ Use this reference when maintaining or debugging the runner.
 
 ## Runtime configuration and fixed request settings
 
-- Endpoints: primary `AZURE_OPENAI_GPT6_ENDPOINT`, backup
-  `AZURE_OPENAI_GPT6_BACKUP_ENDPOINT`, and legacy `AZURE_OPENAI_ENDPOINT`
-  (overridable by `AZURE_OPENAI_FALLBACK_ENDPOINT`). CLI overrides are
-  `--endpoint`, `--backup-endpoint`, and `--fallback-endpoint`; no resource URL
-  is committed. See CONFIGURATION.md for single-resource compatibility.
+- Endpoints: primary `AZURE_OPENAI_GPT6_ENDPOINT` (else
+  `AZURE_OPENAI_ENDPOINT`), optional backup `AZURE_OPENAI_GPT6_BACKUP_ENDPOINT`,
+  and fallback `AZURE_OPENAI_FALLBACK_ENDPOINT` (else `AZURE_OPENAI_ENDPOINT`,
+  else the primary). CLI overrides are `--endpoint`, `--backup-endpoint`, and
+  `--fallback-endpoint`; no resource URL is committed. Settings may also come
+  from the private env file loaded by `cli()` (see CONFIGURATION.md); the
+  process environment wins.
 - Primary deployment: `AZURE_OPENAI_DEPLOYMENT`, defaulting to
   `gpt-6-astra`.
 - Backup deployment: `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` or
   `--backup-deployment`, defaulting to the primary deployment name.
-- Error/rate-limit fallbacks: GPT-6 backup resource, `gpt-5.6-sol`,
-  `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro` on the legacy resource.
+- Error/rate-limit fallbacks: the GPT-6 backup resource, then
+  `AZURE_OPENAI_FALLBACK_DEPLOYMENTS` on the fallback resource (default
+  `gpt-5.6-sol`, then `gpt-5.4-pro`; `none` disables them).
 - API: Responses
-- Providers: Azure OpenAI (default when an Azure endpoint variable or endpoint
-  option is set) or OpenAI (`--provider openai`, `OPENAI_API_KEY`, optional
-  `OPENAI_BASE_URL`, model chain `gpt-6-astra`, `gpt-5.6-sol`,
-  `gpt-5.4-pro`). Journal `submitting` records include `provider` (absent
-  means Azure); recovery refuses jobs from the other provider, and
-  credentials are refused for the other provider's hosts.
-- Authentication: Azure Entra ID by default through
+- Sign-in methods: `entra`, `azure-key`, and `openai-key`, ordered by `--auth`
+  or `DEEP_THINK_AUTH`; without either, one method is detected (Azure when an
+  Azure endpoint variable or endpoint option is set). OpenAI uses
+  `OPENAI_API_KEY`, optional `OPENAI_BASE_URL`, and the chain `gpt-6-astra`
+  then `OPENAI_FALLBACK_MODELS` (default `gpt-5.6-sol`, `gpt-5.4-pro`). Later
+  providers' chains follow earlier ones. Journal `submitting` records include
+  `provider` (absent means Azure); recovery refuses jobs whose provider is not
+  listed, and credentials are refused for the other provider's hosts.
+- Authentication: Azure Entra ID through
   `DefaultAzureCredential(process_timeout=60)` and
   `get_bearer_token_provider(..., "https://ai.azure.com/.default")`; the longer
   subprocess timeout accommodates slow Azure CLI token commands. Azure API keys
-  (`--azure-auth key`) are sent only in the `api-key` header (the SDK key is
-  empty, so no `Authorization` header is sent). OpenAI keys use bearer auth.
+  (`azure-key`) are sent only in the `api-key` header (the SDK key is empty, so
+  no `Authorization` header is sent). OpenAI keys use bearer auth. Several
+  Azure methods share one `AuthFallbackClient` per resource, which moves to
+  the next method after a credential error or HTTP 401/403.
 - GPT-6 and GPT-5.6 reasoning: `{"mode": "pro", "effort": "max",
   "context": "all_turns", "summary": "auto"}`
 - GPT-5.4 Pro fallback reasoning: `{"effort": "xhigh",
@@ -53,7 +60,8 @@ The fixed Entra scope above is a public protocol identifier, not a credential.
 
 ## Retry policy
 
-Make at most five total submission attempts by default. Retry:
+By default, make one submission attempt per routed model, and at least five
+(at most ten). Retry:
 
 - Connection failures before the request is sent (`httpx.ConnectError`,
   `ConnectTimeout`, or `PoolTimeout` beneath the SDK exception).
@@ -78,8 +86,11 @@ Mandatory journaling cannot close the window in which Azure accepts a request
 but the client never receives its ID.
 
 On every retryable submission failure, advance through the primary GPT-6
-resource, backup GPT-6 resource, `gpt-5.6-sol`, `gpt-5.6-sol-nofilters`, and
-`gpt-5.4-pro`; cycle to the primary only if the attempt budget permits.
+resource, the optional backup GPT-6 resource, the configured fallback
+deployments, and then the next listed provider's chain; cycle to the primary
+only if the attempt budget permits. A credential error or HTTP 401/403 skips
+straight to the next listed provider when every method of the current one has
+failed; with no other provider it is terminal.
 A new logical request always starts on its primary, including rollover and
 visible-transcript summaries. Apply failover before acceptance or after a
 terminal transient/malformed/empty response. Transient failures while polling

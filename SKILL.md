@@ -32,30 +32,23 @@ not authenticate model requests.
    python -m pip install --upgrade -r "<skill-dir>/scripts/requirements.txt"
    ```
 
-3. Confirm a provider is configured (see [CONFIGURATION.md](CONFIGURATION.md)).
-   Never ask for, print, or write a key; keys stay in environment variables.
+3. Confirm a model connection is configured (see
+   [CONFIGURATION.md](CONFIGURATION.md)). Settings come from the environment
+   or the user's private env file (`~/.config/deep-think/.env`, or the path in
+   `DEEP_THINK_ENV_FILE`); shell variables win. The template is
+   `<skill-dir>/.env.example`. Never ask for, print, or write a key, and do not
+   edit the env file unless the user asks.
    - **OpenAI:** `OPENAI_API_KEY` (optional `OPENAI_BASE_URL`).
-   - **Azure, API key:** the endpoints below plus `AZURE_OPENAI_API_KEY` or a
+   - **Azure, Microsoft Entra ID:** `AZURE_OPENAI_ENDPOINT` (or the
+     multi-resource variables) plus `az login` or a managed identity.
+   - **Azure, API key:** the endpoint plus `AZURE_OPENAI_API_KEY` or a
      per-resource key variable.
-   - **Azure, Microsoft Entra ID (default for Azure):** the endpoints below and
-     `az login` or a managed identity.
 
-   Azure endpoint variables have no committed default:
-
-   ```powershell
-   $env:AZURE_OPENAI_GPT6_ENDPOINT = Read-Host "GPT-6 primary Responses URL (East US)"
-   $env:AZURE_OPENAI_GPT6_BACKUP_ENDPOINT = Read-Host "GPT-6 backup Responses URL (South Central US)"
-   $env:AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT = "gpt-6-astra-nofilters"
-   $env:AZURE_OPENAI_ENDPOINT = Read-Host "Existing GPT-5.6/GPT-5.4 v1 endpoint"
-   ```
-
-   Both GPT-6 names default to `gpt-6-astra`; use
-   `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` for a differently named backup.
-   Accept v1 base URLs or full preview Responses URLs with only an
-   `api-version` query parameter. Override detection with
-   `--provider azure|openai` and `--azure-auth entra|key`; an explicit
-   `--endpoint` selects Azure unless `--provider openai` is also given.
-   Remove stale `AZURE_OPENAI_DEPLOYMENT` overrides to use the new default.
+   One method is detected automatically. `DEEP_THINK_AUTH` or `--auth` lists
+   methods (`entra`, `azure-key`, `openai-key`) in priority order, and later
+   methods are backups. An explicit `--endpoint` selects Azure unless
+   `--auth openai-key` is given. Remove a stale `AZURE_OPENAI_DEPLOYMENT`
+   override to use the default `gpt-6-astra`.
 
 Read [references/azure-openai.md](references/azure-openai.md) only when changing
 the endpoint, authentication, model settings, or context policy.
@@ -86,7 +79,9 @@ to stderr.
 
 ## Retry and recover
 
-Use the defaults unless the environment requires a different bounded policy:
+Use the defaults unless the environment requires a different bounded policy.
+By default each request gets one submission attempt per routed model, and at
+least five:
 
 ```powershell
 python "<skill-dir>/scripts/deep_think.py" ask `
@@ -99,25 +94,30 @@ python "<skill-dir>/scripts/deep_think.py" ask `
 
 Allow retries for connection failures before a request is sent, malformed
 responses that still carry a response ID, empty completed responses, HTTP
-408/409/429/500/503 and other non-gateway 5xx responses, and Azure transient
+408/409/429/500/503 and other non-gateway 5xx responses, and transient
 response codes. Respect `Retry-After`; otherwise use exponential backoff with
-jitter. Do not retry authentication, authorization, ordinary validation errors,
-content refusals, or other permanent 4xx failures. Validate every response field
-that later code uses before leaving the application retry loop so malformed HTTP
-200 payloads cannot escape as late `TypeError` or `AttributeError` crashes.
+jitter. Do not retry ordinary validation errors, content refusals, or other
+permanent 4xx failures. A sign-in failure (no Entra ID token, or HTTP 401/403)
+switches to the next listed `--auth` method and otherwise stops. Validate every
+response field that later code uses before leaving the application retry loop
+so malformed HTTP 200 payloads cannot escape as late `TypeError` or
+`AttributeError` crashes.
 
 Never resubmit an ambiguous submission. Read timeouts, disconnects after
 sending, gateway HTTP 502/504, interrupted submissions, and success responses
-without a readable ID are recorded as `submission_unknown`: Azure may already be
-running that request, and Azure documents no idempotency key for Responses.
+without a readable ID are recorded as `submission_unknown`: the service may
+already be running that request, and the Responses API documents no
+idempotency key.
 
 For retryable submission failures or terminal transient response errors, route
-bounded attempts in this order: `gpt-6-astra` primary resource,
-`gpt-6-astra` backup resource, `gpt-5.6-sol`, `gpt-5.6-sol-nofilters`,
-then `gpt-5.4-pro`. Also advance on a submission-level `DeploymentNotFound`
-404; other permanent 4xx errors remain terminal. If attempts remain, cycle
-back to the primary. Every new logical request starts on the primary.
-Preserve `pro` mode and `max` effort on both GPT-6 and both GPT-5.6 targets. For the
+bounded attempts through the chain: `gpt-6-astra` on the primary resource, an
+optional backup GPT-6 resource, then the fallback deployments (by default
+`gpt-5.6-sol`, then `gpt-5.4-pro`; set `AZURE_OPENAI_FALLBACK_DEPLOYMENTS` or
+`OPENAI_FALLBACK_MODELS`), then the chain of the next listed provider. Also
+advance on a submission-level `DeploymentNotFound` 404; other permanent 4xx
+errors remain terminal. If attempts remain, cycle back to the primary. Every
+new logical request starts on the primary.
+Preserve `pro` mode and `max` effort on GPT-6 and GPT-5.6 targets. For the
 5.4 fallback only, omit unsupported reasoning mode/context settings and use
 `xhigh`, its maximum supported effort. Record the deployment and effective
 reasoning profile in the transcript.
@@ -206,10 +206,11 @@ original resource is recorded as no longer running, and its output is lost. The
 journal contains prompts and resource endpoint names but no credentials; review
 it before committing, as with transcripts. Treat journals from other people as
 untrusted: the runner rejects artifact names that would leave `requests\` and
-sends credentials only to endpoints configured for the selected provider. Each
-job records its provider; recover it with that `--provider` (shown in
-`status`). After changing endpoint configuration, pass an old recorded endpoint
-explicitly with `--endpoint` to resume, cancel, or reconcile its job.
+sends credentials only to endpoints configured for the job's provider. Each
+job records its provider; recover it with an `--auth` list that includes that
+provider (`status` shows `--auth openai-key` for OpenAI jobs). After changing
+endpoint configuration, pass an old recorded endpoint explicitly with
+`--endpoint` to resume, cancel, or reconcile its job.
 
 ## Continue rigorously
 
