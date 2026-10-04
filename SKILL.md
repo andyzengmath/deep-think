@@ -1,6 +1,6 @@
 ---
 name: deep-think
-description: "Run persistent, maximum-depth mathematical research through Azure OpenAI GPT-6 Astra with GPT-5.6 Sol and GPT-5.4 Pro backups, Microsoft Entra ID, Responses API pro mode, max reasoning effort, structured Markdown, local full-context replay, and automatic long-context rollover summaries. Use for open problems, difficult proofs, counterexample searches, novel constructions, deep theory development, or any long multi-turn math investigation needing version-controlled continuity."
+description: "Run persistent, maximum-depth mathematical research through Azure OpenAI GPT-6 Astra with GPT-5.6 Sol and GPT-5.4 Pro backups, Microsoft Entra ID, Responses API pro mode, max reasoning effort, structured Markdown, local full-context replay, automatic long-context rollover summaries, and journaled crash recovery (status, resume, cancel, reconcile). Use for open problems, difficult proofs, counterexample searches, novel constructions, deep theory development, any long multi-turn math investigation needing version-controlled continuity, or recovering an interrupted, locked, or still-running deep-think request without duplicating paid work."
 ---
 
 # Deep Think
@@ -91,13 +91,19 @@ python ".github\skills\deep-think\scripts\deep_think.py" ask `
   --retry-max-delay 30
 ```
 
-Allow retries for connection/timeouts, malformed responses, empty completed
-responses, HTTP 408/409/429/5xx, and Azure transient response codes. Respect
-`Retry-After`; otherwise use exponential backoff with jitter. Do not retry
-authentication, authorization, ordinary validation errors, content refusals,
-or other permanent 4xx failures. Validate every response field that later code
-uses before leaving the application retry loop so malformed HTTP 200 payloads
-cannot escape as late `TypeError` or `AttributeError` crashes.
+Allow retries for connection failures before a request is sent, malformed
+responses that still carry a response ID, empty completed responses, HTTP
+408/409/429/500/503 and other non-gateway 5xx responses, and Azure transient
+response codes. Respect `Retry-After`; otherwise use exponential backoff with
+jitter. Do not retry authentication, authorization, ordinary validation errors,
+content refusals, or other permanent 4xx failures. Validate every response field
+that later code uses before leaving the application retry loop so malformed HTTP
+200 payloads cannot escape as late `TypeError` or `AttributeError` crashes.
+
+Never resubmit an ambiguous submission. Read timeouts, disconnects after
+sending, gateway HTTP 502/504, interrupted submissions, and success responses
+without a readable ID are recorded as `submission_unknown`: Azure may already be
+running that request, and Azure documents no idempotency key for Responses.
 
 For retryable submission failures or terminal transient response errors, route
 bounded attempts in this order: `gpt-6-astra` primary resource,
@@ -145,6 +151,58 @@ Summarize oversized visible transcripts in bounded chunks without silent
 truncation. After an output-budget exhaustion, retry only when the fresh-volume
 `max_output_tokens` is strictly larger than the exhausted original budget;
 otherwise persist the successful rollover and split or narrow the request.
+Resuming a turn never grants a second reactive recovery, and a rollover is never
+paid for when it cannot make room for the prompt. If the answer after a
+reactive rollover fails on its output or context limit, the rollover is kept:
+continue with a narrower prompt.
+
+## Recover interrupted requests
+
+Every request is journaled automatically in
+`deep-think-transcripts\<project>\requests\journal.jsonl`: the request
+fingerprint, resource, and deployment before submission; the response ID,
+fsynced, before polling; and each completed result before the turn commits.
+Journaling is mandatory; if it cannot be written, nothing is submitted.
+
+After an interruption, a lock message, or any error that says a job may still be
+running, inspect the project first. `status` is read-only and safe while another
+writer runs:
+
+```powershell
+$runner = ".github\skills\deep-think\scripts\deep_think.py"
+python $runner status --project "project-slug"
+python $runner resume --project "project-slug"
+python $runner cancel --project "project-slug"
+python $runner reconcile --project "project-slug"
+```
+
+- `resume` finishes the unfinished turn from its journaled prompt. It polls
+  known response IDs on their original resources, reuses cached completions,
+  and never resubmits a known or ambiguous request. Re-running the identical
+  `ask` behaves the same way.
+- `cancel` stops active background jobs on their original resources. If a job
+  has already finished, it records the result instead and caches completed
+  output for `resume`.
+- `reconcile` records each active job's current remote status and caches
+  completed results for `resume`. Use `--attempt ATTEMPT --response-id ID` for
+  an ID found in Azure telemetry, `--confirm-no-remote-job --reason TEXT` only
+  after verifying that an unknown submission left no running job,
+  `--abandon-turn --reason TEXT` to discard an unfinished turn with no running
+  work, and `--release-lock` only for a lock whose owner cannot be verified.
+
+A dead writer process does not prove its Azure job ended. Locks left by dead
+processes are recovered automatically, but running, unknown, or completed but
+uncommitted requests block a different prompt until resolved. A pre-journal
+stale lock is recorded as an unresolved unknown submission. Never delete the
+lock or journal by hand. Background responses stored with `store=false` are
+retained only briefly after completion, so resume promptly; an HTTP 404 on the
+original resource is recorded as no longer running, and its output is lost. The
+journal contains prompts and resource endpoint names but no credentials; review
+it before committing, as with transcripts. Treat journals from other people as
+untrusted: the runner rejects artifact names that would leave `requests\` and
+sends credentials only to configured endpoints. After changing endpoint
+configuration, pass an old recorded endpoint explicitly with `--endpoint` to
+resume, cancel, or reconcile its job.
 
 ## Continue rigorously
 
@@ -179,6 +237,7 @@ Find all records under:
 deep-think-transcripts/<project>/
 |-- state.json
 |-- research-graph.json
+|-- requests/journal.jsonl
 |-- 0001-transcript.md
 |-- 0001-context.json
 `-- ...
@@ -196,8 +255,8 @@ Run only one writer per project. The runner creates `.deep-think.lock` while a
 turn is active and verifies a deterministic `state.json` digest plus the
 current context/transcript checksums before every continuation. Current state
 files require all three digests; truly legacy state files are accepted once and
-migrated on the next successful write. If a process crashes, remove a stale
-lock only after confirming that no request for that project remains active.
+migrated on the next successful write. Recover crashed writers with the
+commands above, not by deleting the lock.
 
 Allow automatic rollover. The runner treats 900,000 tokens as a context ceiling,
 caps each response to stay below it, and rolls over before fewer than 25,000

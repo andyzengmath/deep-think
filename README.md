@@ -106,6 +106,24 @@ python ".github\skills\deep-think\scripts\deep_think.py" ask `
 Research records are written to `deep-think-transcripts\<project>\`. Review
 their contents before committing them.
 
+## Recover interrupted runs
+
+Every Azure submission is journaled in
+`deep-think-transcripts\<project>\requests\journal.jsonl` before it is sent,
+and its response ID is saved before polling. After a crash, lock message, or
+polling timeout, inspect the project and continue without duplicating paid
+requests:
+
+```powershell
+python ".github\skills\deep-think\scripts\deep_think.py" status --project "project-slug"
+python ".github\skills\deep-think\scripts\deep_think.py" resume --project "project-slug"
+```
+
+`resume` polls known jobs on their original resources and commits cached
+results. `cancel` stops running jobs, and `reconcile` records remote status or
+explicit decisions about ambiguous submissions. Requests whose acceptance is
+unknown are never resubmitted automatically. Never delete the lock by hand.
+
 ## Persistent proof-strategy workflow
 
 For sustained projects, use a scope-aware AND/OR proof graph with best-first

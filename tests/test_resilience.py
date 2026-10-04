@@ -257,13 +257,18 @@ class ServiceRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             options = self.seed(runner, root)
             project = Path(root) / "recovery"
-            before = {p.name: p.read_bytes() for p in project.iterdir()}
+
+            def committed_files():
+                # The request journal changes by design; committed files must not.
+                return {
+                    p.name: p.read_bytes() for p in project.iterdir() if p.is_file()
+                }
+
+            before = committed_files()
             client = FakeClient([failed_job("failed")])
             with self.assertRaises(runner.DeepThinkError):
                 runner.run_turn(client, **options)
-            self.assertEqual(
-                before, {p.name: p.read_bytes() for p in project.iterdir()}
-            )
+            self.assertEqual(before, committed_files())
         self.assertEqual(len(client.responses.calls), 1)
 
     def test_opt_in_recovers_from_visible_history_once(self):
