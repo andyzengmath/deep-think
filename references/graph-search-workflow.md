@@ -158,7 +158,7 @@ For PowerShell installations, structural validation uses the existing
 
 ```powershell
 $graph = Get-Content -LiteralPath "deep-think-transcripts\project-slug\research-graph.json" -Raw
-if (-not (Test-Json -Json $graph -SchemaFile ".github\skills\deep-think\references\research-graph.schema.json")) {
+if (-not (Test-Json -Json $graph -SchemaFile "<skill-dir>/references/research-graph.schema.json")) {
     throw "Invalid research graph"
 }
 ```

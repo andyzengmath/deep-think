@@ -1,6 +1,6 @@
 ---
 name: deep-think
-description: "Run persistent, maximum-depth mathematical research through Azure OpenAI GPT-6 Astra with GPT-5.6 Sol and GPT-5.4 Pro backups, Microsoft Entra ID, Responses API pro mode, max reasoning effort, structured Markdown, local full-context replay, automatic long-context rollover summaries, and journaled crash recovery (status, resume, cancel, reconcile). Use for open problems, difficult proofs, counterexample searches, novel constructions, deep theory development, any long multi-turn math investigation needing version-controlled continuity, or recovering an interrupted, locked, or still-running deep-think request without duplicating paid work."
+description: "Run persistent, maximum-depth mathematical research with GPT-6 Astra (GPT-5.6 Sol and GPT-5.4 Pro backups) through Azure OpenAI (Microsoft Entra ID or API key) or the OpenAI API, using Responses API pro mode, max reasoning effort, structured Markdown, local full-context replay, automatic long-context rollover summaries, and journaled crash recovery (status, resume, cancel, reconcile). Use for open problems, difficult proofs, counterexample searches, novel constructions, deep theory development, any long multi-turn math investigation needing version-controlled continuity, or recovering an interrupted, locked, or still-running deep-think request without duplicating paid work."
 ---
 
 # Deep Think
@@ -11,45 +11,44 @@ turns.
 
 ## Prepare
 
-Resolve bundled scripts and references relative to this loaded skill's base
-directory, not the working repository. The examples below show a project
-installation; for a personal Copilot CLI installation, use
-`$HOME\.copilot\skills\deep-think\scripts\deep_think.py` instead. Keep the
-working directory and transcript root in the research project, not the skill
-directory. Use the current shell's Azure configuration and Entra authentication;
-Copilot's GitHub login does not authenticate Azure requests.
+Run bundled scripts from this skill's own folder, not the working repository.
+In the commands below, `<skill-dir>` means that folder (for example
+`~/.agents/skills/deep-think`, `~/.claude/skills/deep-think`, or a project's
+`.agents/skills/deep-think`); use `python3` where `python` is unavailable. Keep
+the working directory and transcript root in the research project. Model
+credentials come only from the environment and the user's private env file;
+your agent's own login does not authenticate model requests.
 
 1. Read [references/research-protocol.md](references/research-protocol.md) before
    starting or resuming an investigation.
    For sustained research, also follow
-   `references\graph-search-workflow.md`: locate and read the project's
+   `references/graph-search-workflow.md`: locate and read the project's
    `research-graph.json` before selecting another mathematical action.
    Initialize a new graph only for a genuinely new project, not because the
    current working directory changed.
 2. Install the current SDKs if the runner reports missing dependencies:
 
-   ```powershell
-   python -m pip install --upgrade -r ".github\skills\deep-think\scripts\requirements.txt"
+   ```bash
+   python -m pip install --upgrade -r "<skill-dir>/scripts/requirements.txt"
    ```
 
-3. Follow [CONFIGURATION.md](CONFIGURATION.md) to grant the required Azure role
-   and authenticate through `DefaultAzureCredential`. Use `az login` for local
-   development or a managed identity in Azure. Never add an API key.
-4. Configure the resource-specific endpoint and deployment in the current
-   shell. The endpoint has no committed default:
+3. Confirm a model connection is configured (see
+   [CONFIGURATION.md](CONFIGURATION.md)). Settings come from the environment
+   or the user's private env file (`~/.config/deep-think/.env`, or the path in
+   `DEEP_THINK_ENV_FILE`); shell variables win. The template is
+   `<skill-dir>/.env.example`. Never ask for, print, or write a key, and do not
+   edit the env file unless the user asks.
+   - **OpenAI:** `OPENAI_API_KEY` (optional `OPENAI_BASE_URL`).
+   - **Azure, Microsoft Entra ID:** `AZURE_OPENAI_ENDPOINT` (or the
+     multi-resource variables) plus `az login` or a managed identity.
+   - **Azure, API key:** the endpoint plus `AZURE_OPENAI_API_KEY` or a
+     per-resource key variable.
 
-   ```powershell
-   $env:AZURE_OPENAI_GPT6_ENDPOINT = Read-Host "GPT-6 primary Responses URL (East US)"
-   $env:AZURE_OPENAI_GPT6_BACKUP_ENDPOINT = Read-Host "GPT-6 backup Responses URL (South Central US)"
-   $env:AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT = "gpt-6-astra-nofilters"
-   $env:AZURE_OPENAI_ENDPOINT = Read-Host "Existing GPT-5.6/GPT-5.4 v1 endpoint"
-   ```
-
-   Both GPT-6 names default to `gpt-6-astra`; use
-   `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` for a differently named backup.
-   Accept v1 base URLs or full preview Responses URLs with only an
-   `api-version` query parameter.
-   Remove stale `AZURE_OPENAI_DEPLOYMENT` overrides to use the new default.
+   Methods are detected automatically. `DEEP_THINK_AUTH` or `--auth` lists
+   methods (`entra`, `azure-key`, `openai-key`) in priority order, and later
+   methods are backups. An explicit `--endpoint` selects Azure unless
+   `--auth openai-key` is given. Remove a stale `AZURE_OPENAI_DEPLOYMENT`
+   override to use the default `gpt-6-astra`.
 
 Read [references/azure-openai.md](references/azure-openai.md) only when changing
 the endpoint, authentication, model settings, or context policy.
@@ -60,7 +59,7 @@ Use one stable lowercase project slug for the entire investigation. Supply the
 title only on the first turn.
 
 ```powershell
-python ".github\skills\deep-think\scripts\deep_think.py" ask `
+python "<skill-dir>/scripts/deep_think.py" ask `
   --project "project-slug" `
   --title "Research title" `
   --prompt-file "path\to\problem.md"
@@ -69,7 +68,7 @@ python ".github\skills\deep-think\scripts\deep_think.py" ask `
 Continue in the same context by reusing the project slug and omitting the title:
 
 ```powershell
-python ".github\skills\deep-think\scripts\deep_think.py" ask `
+python "<skill-dir>/scripts/deep_think.py" ask `
   --project "project-slug" `
   --prompt "Audit the proposed proof of Lemma 4 and repair any gap."
 ```
@@ -80,38 +79,46 @@ to stderr.
 
 ## Retry and recover
 
-Use the defaults unless the environment requires a different bounded policy:
+Use the defaults unless the environment requires a different bounded policy.
+By default each request gets one submission attempt per routed model, at least
+five and at most ten; pass `--max-attempts` only to set a fixed budget, since a
+small value can cut a backup chain short:
 
 ```powershell
-python ".github\skills\deep-think\scripts\deep_think.py" ask `
+python "<skill-dir>/scripts/deep_think.py" ask `
   --project "project-slug" `
   --prompt "Continue the proof audit." `
-  --max-attempts 5 `
   --retry-base-delay 1 `
   --retry-max-delay 30
 ```
 
 Allow retries for connection failures before a request is sent, malformed
 responses that still carry a response ID, empty completed responses, HTTP
-408/409/429/500/503 and other non-gateway 5xx responses, and Azure transient
+408/409/429/500/503 and other non-gateway 5xx responses, and transient
 response codes. Respect `Retry-After`; otherwise use exponential backoff with
-jitter. Do not retry authentication, authorization, ordinary validation errors,
-content refusals, or other permanent 4xx failures. Validate every response field
-that later code uses before leaving the application retry loop so malformed HTTP
-200 payloads cannot escape as late `TypeError` or `AttributeError` crashes.
+jitter. Do not retry ordinary validation errors, content refusals, or other
+permanent 4xx failures. A sign-in failure (no Entra ID token, or HTTP 401/403)
+switches to the next listed `--auth` method and otherwise stops. Validate every
+response field that later code uses before leaving the application retry loop
+so malformed HTTP 200 payloads cannot escape as late `TypeError` or
+`AttributeError` crashes.
 
 Never resubmit an ambiguous submission. Read timeouts, disconnects after
 sending, gateway HTTP 502/504, interrupted submissions, and success responses
-without a readable ID are recorded as `submission_unknown`: Azure may already be
-running that request, and Azure documents no idempotency key for Responses.
+without a readable ID are recorded as `submission_unknown`: the service may
+already be running that request, and the Responses API documents no
+idempotency key.
 
 For retryable submission failures or terminal transient response errors, route
-bounded attempts in this order: `gpt-6-astra` primary resource,
-`gpt-6-astra` backup resource, `gpt-5.6-sol`, `gpt-5.6-sol-nofilters`,
-then `gpt-5.4-pro`. Also advance on a submission-level `DeploymentNotFound`
-404; other permanent 4xx errors remain terminal. If attempts remain, cycle
-back to the primary. Every new logical request starts on the primary.
-Preserve `pro` mode and `max` effort on both GPT-6 and both GPT-5.6 targets. For the
+bounded attempts through the chain: `gpt-6-astra` on the primary resource, an
+optional backup GPT-6 resource, then the fallback deployments (by default
+`gpt-5.6-sol`, then `gpt-5.4-pro`; set `AZURE_OPENAI_FALLBACK_DEPLOYMENTS` or
+`OPENAI_FALLBACK_MODELS`), then the chain of the next listed provider. Also
+advance on a submission-level `DeploymentNotFound` (404) or OpenAI
+`model_not_found` (403 or 404); other permanent 4xx errors remain terminal. If
+attempts remain, cycle back to the primary. Every new logical request starts
+on the primary.
+Preserve `pro` mode and `max` effort on GPT-6 and GPT-5.6 targets. For the
 5.4 fallback only, omit unsupported reasoning mode/context settings and use
 `xhigh`, its maximum supported effort. Record the deployment and effective
 reasoning profile in the transcript.
@@ -169,7 +176,7 @@ running, inspect the project first. `status` is read-only and safe while another
 writer runs:
 
 ```powershell
-$runner = ".github\skills\deep-think\scripts\deep_think.py"
+$runner = "<skill-dir>/scripts/deep_think.py"
 python $runner status --project "project-slug"
 python $runner resume --project "project-slug"
 python $runner cancel --project "project-slug"
@@ -182,13 +189,20 @@ python $runner reconcile --project "project-slug"
   `ask` behaves the same way.
 - `cancel` stops active background jobs on their original resources. If a job
   has already finished, it records the result instead and caches completed
-  output for `resume`.
+  output for `resume`. A job it cannot contact (a refused endpoint, a missing
+  credential, or a failed sign-in) is reported in its result, and the other
+  jobs are still cancelled.
 - `reconcile` records each active job's current remote status and caches
   completed results for `resume`. Use `--attempt ATTEMPT --response-id ID` for
-  an ID found in Azure telemetry, `--confirm-no-remote-job --reason TEXT` only
+  an ID found in Azure telemetry or the OpenAI dashboard logs,
+  `--confirm-no-remote-job --reason TEXT` only
   after verifying that an unknown submission left no running job,
   `--abandon-turn --reason TEXT` to discard an unfinished turn with no running
   work, and `--release-lock` only for a lock whose owner cannot be verified.
+
+`cancel` and `reconcile` print a JSON report. They exit with 0 when every job
+was handled, 1 when the report lists jobs that could not be handled (check
+`failed` and each `error`), and 2 when the command itself failed.
 
 A dead writer process does not prove its Azure job ended. Locks left by dead
 processes are recovered automatically, but running, unknown, or completed but
@@ -196,13 +210,19 @@ uncommitted requests block a different prompt until resolved. A pre-journal
 stale lock is recorded as an unresolved unknown submission. Never delete the
 lock or journal by hand. Background responses stored with `store=false` are
 retained only briefly after completion, so resume promptly; an HTTP 404 on the
-original resource is recorded as no longer running, and its output is lost. The
+original Azure resource is recorded as no longer running, and its output is
+lost. An OpenAI 404 cannot tell a deleted response from one hidden by a
+different project's key, so it becomes an unknown submission to resolve with
+`reconcile`. The
 journal contains prompts and resource endpoint names but no credentials; review
 it before committing, as with transcripts. Treat journals from other people as
 untrusted: the runner rejects artifact names that would leave `requests\` and
-sends credentials only to configured endpoints. After changing endpoint
-configuration, pass an old recorded endpoint explicitly with `--endpoint` to
-resume, cancel, or reconcile its job.
+sends credentials only to endpoints configured for the job's provider. Each
+job records its provider; recover it with an `--auth` list that includes that
+provider (`status` shows `--auth openai-key` for OpenAI jobs). After changing
+endpoint configuration, pass an old recorded endpoint explicitly with
+`--endpoint` and a single-provider `--auth` list to resume, cancel, or
+reconcile its job.
 
 ## Continue rigorously
 

@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "deep_think.py"
+
+# Keep every test (and subprocess) independent of the developer's shell
+# settings and private env file.
+for _name in [
+    name
+    for name in os.environ
+    if name.startswith(("AZURE_OPENAI_", "OPENAI_", "DEEP_THINK_"))
+]:
+    del os.environ[_name]
+os.environ["DEEP_THINK_ENV_FILE"] = os.devnull
 
 
 def load_module():
@@ -165,7 +176,9 @@ class RequestConfigurationTests(unittest.TestCase):
                 ["ask", "--project", "upgrade", "--prompt", "Continue."]
             )
         self.assertEqual(args.deployment, "gpt-6-astra")
-        self.assertEqual(args.max_attempts, 5)
+        # None gives every routed target one attempt, and never fewer than five.
+        self.assertIsNone(args.max_attempts)
+        self.assertEqual(deep_think.DEFAULT_MAX_ATTEMPTS, 5)
 
     def test_preview_responses_url_preserves_api_version_for_create_and_poll(self):
         import httpx
@@ -398,6 +411,7 @@ class CrossEndpointFailoverTests(unittest.TestCase):
             backup_endpoint="backup",
             fallback_endpoint="legacy",
             client_factory=clients.__getitem__,
+            fallback_deployments=("gpt-5.6-sol", "gpt-5.6-sol-alt", "gpt-5.4-pro"),
         )
         return router, primary, backup, legacy
 
@@ -426,7 +440,7 @@ class CrossEndpointFailoverTests(unittest.TestCase):
                 "gpt-6-astra",
                 "gpt-6-astra",
                 "gpt-5.6-sol",
-                "gpt-5.6-sol-nofilters",
+                "gpt-5.6-sol-alt",
                 "gpt-5.4-pro",
             ],
         )
@@ -715,14 +729,14 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(len(client.responses.calls), 2)
         self.assertEqual(
             [call["model"] for call in client.responses.calls],
-            ["gpt-5.6-sol", "gpt-5.6-sol-nofilters"],
+            ["gpt-5.6-sol", "gpt-5.4-pro"],
         )
-        self.assertEqual(outcome.deployment, "gpt-5.6-sol-nofilters")
+        self.assertEqual(outcome.deployment, "gpt-5.4-pro")
         self.assertEqual(sleeps, [2.5])
         self.assertIn("HTTP 429", events[0].reason)
         self.assertIn("no_capacity", events[0].reason)
         self.assertIn(
-            "switching deployment to gpt-5.6-sol-nofilters",
+            "switching deployment to gpt-5.4-pro",
             events[0].reason,
         )
 
@@ -730,7 +744,6 @@ class RetryTests(unittest.TestCase):
         deep_think = load_module()
         client = FakeClient(
             [
-                make_status_error(429, "rate_limit_exceeded"),
                 make_status_error(429, "rate_limit_exceeded"),
                 make_status_error(429, "rate_limit_exceeded"),
                 FakeResponse("resp-complete", "Complete proof."),
@@ -741,7 +754,7 @@ class RetryTests(unittest.TestCase):
             client,
             {"model": "gpt-5.6-sol", "input": "Prove it."},
             purpose="answer",
-            max_attempts=4,
+            max_attempts=3,
             base_delay=0,
             sleep=lambda _delay: None,
             random_value=lambda: 0,
@@ -749,21 +762,15 @@ class RetryTests(unittest.TestCase):
 
         self.assertEqual(
             [call["model"] for call in client.responses.calls],
-            [
-                "gpt-5.6-sol",
-                "gpt-5.6-sol-nofilters",
-                "gpt-5.4-pro",
-                "gpt-5.6-sol",
-            ],
+            ["gpt-5.6-sol", "gpt-5.4-pro", "gpt-5.6-sol"],
         )
         self.assertEqual(outcome.deployment, "gpt-5.6-sol")
-        self.assertEqual(outcome.retry_count, 3)
+        self.assertEqual(outcome.retry_count, 2)
 
     def test_5_4_fallback_uses_xhigh_without_reasoning_mode(self):
         deep_think = load_module()
         client = FakeClient(
             [
-                make_status_error(429, "rate_limit_exceeded"),
                 make_status_error(429, "rate_limit_exceeded"),
                 FakeResponse("resp-complete", "Complete proof."),
             ]
@@ -790,7 +797,7 @@ class RetryTests(unittest.TestCase):
 
         self.assertEqual(outcome.deployment, "gpt-5.4-pro")
         self.assertEqual(
-            client.responses.calls[2]["reasoning"],
+            client.responses.calls[1]["reasoning"],
             {
                 "effort": "xhigh",
                 "summary": "auto",
@@ -1204,7 +1211,6 @@ class PersistenceTests(unittest.TestCase):
         deep_think = load_module()
         client = FakeClient(
             [
-                make_status_error(429, "rate_limit_exceeded"),
                 make_status_error(429, "rate_limit_exceeded"),
                 FakeResponse("resp-complete", "Complete proof."),
             ]

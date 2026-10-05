@@ -6,6 +6,7 @@ deep-think-transcripts/
 .deep-think.lock
 .env
 .env.*
+!.env.example
 *.local
 *.local.*
 *.key

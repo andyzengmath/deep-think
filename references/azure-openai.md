@@ -4,21 +4,39 @@ Use this reference when maintaining or debugging the runner.
 
 ## Runtime configuration and fixed request settings
 
-- Endpoints: primary `AZURE_OPENAI_GPT6_ENDPOINT`, backup
-  `AZURE_OPENAI_GPT6_BACKUP_ENDPOINT`, and legacy `AZURE_OPENAI_ENDPOINT`
-  (overridable by `AZURE_OPENAI_FALLBACK_ENDPOINT`). CLI overrides are
-  `--endpoint`, `--backup-endpoint`, and `--fallback-endpoint`; no resource URL
-  is committed. See CONFIGURATION.md for single-resource compatibility.
+- Endpoints: primary `AZURE_OPENAI_GPT6_ENDPOINT` (else
+  `AZURE_OPENAI_ENDPOINT`), optional backup `AZURE_OPENAI_GPT6_BACKUP_ENDPOINT`,
+  and fallback `AZURE_OPENAI_FALLBACK_ENDPOINT` (else `AZURE_OPENAI_ENDPOINT`,
+  else the primary). CLI overrides are `--endpoint`, `--backup-endpoint`, and
+  `--fallback-endpoint`; no resource URL is committed. Settings may also come
+  from the private env file loaded by `cli()` (see CONFIGURATION.md); the
+  process environment wins.
 - Primary deployment: `AZURE_OPENAI_DEPLOYMENT`, defaulting to
   `gpt-6-astra`.
 - Backup deployment: `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` or
   `--backup-deployment`, defaulting to the primary deployment name.
-- Error/rate-limit fallbacks: GPT-6 backup resource, `gpt-5.6-sol`,
-  `gpt-5.6-sol-nofilters`, then `gpt-5.4-pro` on the legacy resource.
+- Error/rate-limit fallbacks: the GPT-6 backup resource, then
+  `AZURE_OPENAI_FALLBACK_DEPLOYMENTS` on the fallback resource (default
+  `gpt-5.6-sol`, then `gpt-5.4-pro`; `none` disables them).
 - API: Responses
-- Authentication: `DefaultAzureCredential(process_timeout=60)` and
+- Sign-in methods: `entra`, `azure-key`, and `openai-key`, ordered by `--auth`
+  or `DEEP_THINK_AUTH`; without either, the methods are detected (Azure when an
+  Azure endpoint variable or endpoint option is set, as `azure-key,entra` when
+  an Azure key is set and `entra` otherwise). OpenAI uses `OPENAI_API_KEY`,
+  optional `OPENAI_BASE_URL`, and the chain `gpt-6-astra` then
+  `OPENAI_FALLBACK_MODELS` (default `gpt-5.6-sol`, `gpt-5.4-pro`). Later
+  providers' chains follow earlier ones. Journal `submitting` records include
+  `provider` (absent means Azure; other non-provider values are invalid);
+  recovery refuses jobs whose provider is not listed, and credentials are
+  refused for the other provider's hosts and configured endpoints.
+- Authentication: Azure Entra ID through
+  `DefaultAzureCredential(process_timeout=60)` and
   `get_bearer_token_provider(..., "https://ai.azure.com/.default")`; the longer
-  subprocess timeout accommodates slow Azure CLI token commands.
+  subprocess timeout accommodates slow Azure CLI token commands. Azure API keys
+  (`azure-key`) are sent only in the `api-key` header (the SDK key is empty, so
+  no `Authorization` header is sent). OpenAI keys use bearer auth. Several
+  Azure methods share one `AuthFallbackClient` per resource, which moves to
+  the next method after a credential error or HTTP 401/403.
 - GPT-6 and GPT-5.6 reasoning: `{"mode": "pro", "effort": "max",
   "context": "all_turns", "summary": "auto"}`
 - GPT-5.4 Pro fallback reasoning: `{"effort": "xhigh",
@@ -31,8 +49,9 @@ Use this reference when maintaining or debugging the runner.
 - Client request timeout: 3,600 seconds
 - SDK retries: disabled with `max_retries=0`; the runner owns retry policy
 
-Pass the bearer token provider callable to `OpenAI(api_key=...)`. Do not read,
-accept, or persist API keys.
+Pass the Entra bearer token provider callable to `OpenAI(api_key=...)`. Read
+API keys only from environment variables; never accept them as command-line
+arguments, and never log or persist them.
 
 The endpoint must use HTTPS and include a host. The runner rejects endpoints
 containing user information, arbitrary query parameters, or fragments. The
@@ -43,7 +62,8 @@ The fixed Entra scope above is a public protocol identifier, not a credential.
 
 ## Retry policy
 
-Make at most five total submission attempts by default. Retry:
+By default, make one submission attempt per routed model, and at least five
+(at most ten). Retry:
 
 - Connection failures before the request is sent (`httpx.ConnectError`,
   `ConnectTimeout`, or `PoolTimeout` beneath the SDK exception).
@@ -52,7 +72,9 @@ Make at most five total submission attempts by default. Retry:
   response leaves the retry loop.
 - Empty completed responses.
 - HTTP 408, 409, 429, and non-gateway 5xx responses.
-- Submission-level HTTP 404 with exact code `DeploymentNotFound`.
+- Submission-level HTTP 404 with exact code `DeploymentNotFound` (Azure), or
+  HTTP 403/404 with code `model_not_found` (OpenAI, including a project without
+  access to the model).
 - Azure `server_error`, `too_many_requests`, `rate_limit_exceeded`,
   `no_capacity`, `timeout`, and `temporarily_unavailable` response codes.
 
@@ -68,8 +90,11 @@ Mandatory journaling cannot close the window in which Azure accepts a request
 but the client never receives its ID.
 
 On every retryable submission failure, advance through the primary GPT-6
-resource, backup GPT-6 resource, `gpt-5.6-sol`, `gpt-5.6-sol-nofilters`, and
-`gpt-5.4-pro`; cycle to the primary only if the attempt budget permits.
+resource, the optional backup GPT-6 resource, the configured fallback
+deployments, and then the next listed provider's chain; cycle to the primary
+only if the attempt budget permits. A credential error or HTTP 401/403 skips
+straight to the next listed provider when every method of the current one has
+failed; with no other provider it is terminal.
 A new logical request always starts on its primary, including rollover and
 visible-transcript summaries. Apply failover before acceptance or after a
 terminal transient/malformed/empty response. Transient failures while polling
@@ -99,10 +124,15 @@ headers. A response-object `server_error` is distinct from an HTTP 500.
 Honor `x-should-retry`, `Retry-After`, and `retry-after-ms`, except that HTTP
 429 remains retryable even if `x-should-retry` is `false` so deployment
 failover and same-ID polling recovery cannot be disabled. Otherwise use
-exponential backoff with bounded jitter. Never retry refusals, authentication
-or authorization failures, ordinary bad requests, or other permanent 4xx
-errors, even when `x-should-retry` is `true`. The exact submission-level
-`DeploymentNotFound` exception is target-specific and allows failover.
+exponential backoff with bounded jitter. Never retry refusals, ordinary bad
+requests, or other permanent 4xx errors, even when `x-should-retry` is `true`.
+Sign-in failures (a credential error, or HTTP 401/403 other than
+`model_not_found`) are not retried on the same method; they move to the next
+listed `--auth` method, then to another listed provider that has not failed
+sign-in (wrapping around), and are otherwise terminal. The exact
+submission-level `DeploymentNotFound` 404 and `model_not_found` 403/404 are
+target-specific and allow failover. Clients never follow HTTP redirects, so
+headers such as `api-key` cannot be forwarded to another host.
 Persist only the final complete response.
 
 ## Context policy
@@ -114,7 +144,8 @@ window and count as output tokens.
 The GPT-6 upgrade retains these local budgets rather than assuming a larger
 context window. GPT-6-specific limits are not independently established here;
 service-side context errors still follow the bounded recovery policy.
-Existing projects on built-in older deployments can adopt the new default:
+Existing projects whose primary is a default or configured fallback deployment
+can adopt the new default:
 verify state and file checksums first, retain all history, record the primary
 upgrade, and persist it only through the ordinary successful-turn commit.
 When service-error recovery is explicitly enabled, a completed rollover is
@@ -194,10 +225,15 @@ Keep local writer state separate from remote request state:
   repository. Accept only the bare artifact names the runner writes
   (`<response-id>.json`, `<attempt-id>.response.json`, `<turn-id>.prompt.txt`)
   and require each resolved path to stay directly inside `requests/`; any other
-  name marks the journal as corrupt. The CLI sends Entra tokens only to
-  endpoints configured for the invocation (the GPT-6, backup, and fallback
-  endpoint variables, `AZURE_OPENAI_ENDPOINT`, or explicit endpoint options);
-  it refuses any other recorded resource.
+  name marks the journal as corrupt. The CLI sends credentials only to
+  endpoints configured for the job's provider: for Azure, the GPT-6, backup,
+  and fallback endpoint variables, `AZURE_OPENAI_ENDPOINT`, or explicit
+  endpoint options; for OpenAI, `OPENAI_BASE_URL` (default
+  `https://api.openai.com/v1/`) or an explicit `--endpoint` with a
+  single-provider `--auth` list. It refuses any other recorded resource and any
+  endpoint configured for the other provider. An OpenAI 404 makes the attempt
+  unknown (`remote_not_visible`) rather than finished, because OpenAI hides
+  responses from other projects.
 
 Each turn journals its prompt, deployment, and starting state digest. Re-running
 the identical prompt, or `resume`, continues that turn: a matching request
@@ -219,8 +255,12 @@ HTTP 400 ("Cannot cancel a completed response") for finished jobs, so retrieve
 the job after a failed cancel and record its actual state, caching completed
 output for `resume`. `reconcile`
 retrieves each active ID once, records terminal states, caches completed
-results for `resume`, and treats HTTP 404 on the journaled original resource as
-no longer running. An operator-attached ID must use the attempt's recorded
+results for `resume`, and treats HTTP 404 on the journaled original Azure
+resource as no longer running. For OpenAI, a 404 cannot distinguish a deleted
+response from one owned by another project, so the attempt becomes unknown
+(`remote_not_visible`) instead. A refused endpoint, missing credential, or
+failed sign-in is reported for that job alone; the other jobs are still
+processed. An operator-attached ID must use the attempt's recorded
 resource; if it returns 404 before any successful observation, the attachment
 is rejected and the submission stays unknown. Background responses with
 `store=false` are retained for roughly 10 minutes after completion, so later

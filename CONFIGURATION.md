@@ -1,137 +1,199 @@
-# Secure configuration
+# Configuration
 
-`deep-think` uses Microsoft Entra ID through `DefaultAzureCredential`. It does
-not accept API keys. Resource-specific values and identity credentials must be
-supplied at runtime; none belong in this repository.
+Deep Think reaches a model in one of three ways, called sign-in methods. You
+can use one, or list several in priority order so that later methods back up
+earlier ones.
 
-## Prerequisites
+| Method | Provider and sign-in | Required settings | Optional settings |
+| --- | --- | --- | --- |
+| `entra` | Azure OpenAI with Microsoft Entra ID | An Azure endpoint; `az login`, a managed identity, or workload identity | `AZURE_CLIENT_ID` for a user-assigned identity |
+| `azure-key` | Azure OpenAI with an API key | An Azure endpoint and `AZURE_OPENAI_API_KEY` | Per-resource keys `AZURE_OPENAI_GPT6_API_KEY`, `AZURE_OPENAI_GPT6_BACKUP_API_KEY`, `AZURE_OPENAI_FALLBACK_API_KEY` |
+| `openai-key` | OpenAI API with an API key | `OPENAI_API_KEY` | `OPENAI_BASE_URL` (default `https://api.openai.com/v1/`), `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID` |
 
-You need:
+Prefer Microsoft Entra ID where it is available: it needs no long-lived secret.
+When an Azure key is also set, detection tries the key first, so set
+`DEEP_THINK_AUTH=entra` (or `entra,azure-key`) to put Entra ID first.
 
-1. Two Azure OpenAI resources deploying `gpt-6-astra`, plus the existing
-   GPT-5.6/GPT-5.4 resource.
-2. Each resource's v1 base endpoint or full preview Responses URL.
-3. An Entra identity allowed to invoke that deployment. Assign the narrowest
-   suitable data-plane role, normally **Cognitive Services OpenAI User**, at
-   the resource or deployment scope.
-4. Python dependencies installed from `scripts/requirements.txt`.
+## Where settings come from
 
-## Local PowerShell setup
+The runner reads the process environment, then fills in anything missing from
+a private env file:
 
-Authenticate interactively, then enter the resource settings into the current
-process environment:
+1. The file named by `DEEP_THINK_ENV_FILE`, which must exist. Set it to
+   `NUL` (Windows) or `/dev/null` to skip env files entirely.
+2. Otherwise `$XDG_CONFIG_HOME/deep-think/.env` when `XDG_CONFIG_HOME` is set,
+   or `~/.config/deep-think/.env` (Windows: `%USERPROFILE%\.config\deep-think\.env`).
+   A missing default file is ignored.
 
-```powershell
-az login
-$env:AZURE_OPENAI_GPT6_ENDPOINT = Read-Host "GPT-6 primary Responses URL (East US)"
-$env:AZURE_OPENAI_GPT6_BACKUP_ENDPOINT = Read-Host "GPT-6 backup Responses URL (South Central US)"
-$env:AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT = "gpt-6-astra-nofilters"
-$env:AZURE_OPENAI_ENDPOINT = Read-Host "Existing GPT-5.6/GPT-5.4 v1 endpoint"
-```
+Start from [.env.example](.env.example). The file holds `NAME=value` lines;
+`#` starts a comment, values may be quoted, and an optional `export ` prefix is
+accepted. Only `AZURE_*`, `OPENAI_*`, and `DEEP_THINK_*` variables are allowed,
+so the file cannot change `PATH` or other process settings. Variables already
+set in the environment with a non-empty value always win, which lets CI
+systems, secret managers, and one-off shell overrides take precedence. Errors
+name the file, line, and variable but never print a value.
 
-Copy endpoints from the Azure portal or deployment output. The runner accepts
-HTTPS v1 base URLs and full `/openai/responses?api-version=2025-04-01-preview`
-URLs. For the latter it preserves `api-version` for both creation and polling,
-without appending a second `responses` path. No other query parameters,
-credentials, or fragments are accepted.
+Keep the file outside every repository, readable only by you (`chmod 600` on
+macOS and Linux), and never commit a filled-in copy. An API key in the file is
+only as safe as the file; a secret manager that exports variables into the
+agent's environment is safer still.
 
-The primary deployment defaults to `gpt-6-astra`; an explicit `--deployment`
-or `AZURE_OPENAI_DEPLOYMENT` overrides it. Remove an old deployment override
-or set it to `gpt-6-astra` to activate the new default.
+## Choosing methods and backups
 
-The ordered chain is:
+`--auth` or `DEEP_THINK_AUTH` takes a comma-separated list of distinct methods
+in priority order, for example `entra,openai-key`. Without either, methods are
+detected:
 
-1. `gpt-6-astra` on `AZURE_OPENAI_GPT6_ENDPOINT` (East US).
-2. `gpt-6-astra` on `AZURE_OPENAI_GPT6_BACKUP_ENDPOINT` (South Central US).
-3. `gpt-5.6-sol` on the existing resource.
-4. `gpt-5.6-sol-nofilters` on the existing resource.
-5. `gpt-5.4-pro` on the existing resource.
+1. If an `--endpoint`, `--backup-endpoint`, or `--fallback-endpoint` option or
+   an Azure endpoint variable is set: `azure-key,entra` when an Azure key
+   variable is set (so Entra ID rescues a key that does not fit the resource),
+   otherwise `entra`.
+2. Otherwise `openai-key` when `OPENAI_API_KEY` is set.
+3. Otherwise `entra`, which then reports the missing endpoint.
 
-Both GPT-6 deployment names default to `gpt-6-astra`. If the backup resource
-uses a different deployment name, set `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT`
-or pass `--backup-deployment`; the GPT-6 `pro`/`max` profile is unchanged.
+With several methods, every request follows one ordered chain:
 
-Set `AZURE_OPENAI_FALLBACK_ENDPOINT` to override the existing resource
-(`AZURE_OPENAI_ENDPOINT`). If neither is set, older models use the primary
-resource. If no dedicated GPT-6 endpoint is set, `AZURE_OPENAI_ENDPOINT` also
-serves as the primary. Omitting the backup endpoint selects single-resource
-primary operation; configure both GPT-6 endpoints for the full five-target chain.
-Explicit legacy `--deployment` selections use the legacy resource and start
-at that model in the chain, without promoting back to GPT-6.
+- Each provider's models are tried in turn, as described below. Retryable
+  errors move to the next model; after the last model of one provider, the
+  next provider in the list takes over.
+- Several Azure methods share the same resources. If one cannot sign in
+  (no Entra ID token, or HTTP 401/403), the next is used for that resource
+  immediately, and a note is printed to stderr. A method that cannot be used
+  for a resource, such as a missing per-resource key or `azure-identity` not
+  being installed, is skipped there.
+- If every listed method fails to sign in on a resource, the request moves to
+  another listed provider that has not failed sign-in, wrapping around the
+  chain if attempts remain, and does not return to the failed provider for
+  that request. When no such provider remains, the failure is final.
+- Prompts go only to providers you list. Credentials never cross providers:
+  OpenAI keys are refused for Azure hosts (`*.azure.com`, `*.azure.us`,
+  `*.azure.cn`), Azure keys or Entra ID tokens are refused for `openai.com`
+  hosts, and neither provider's credentials are sent to an endpoint configured
+  only for the other (for example, your `OPENAI_BASE_URL`). Clients never
+  follow HTTP redirects.
+- Cross-provider backups cannot reuse hidden reasoning: encrypted reasoning
+  items from one provider are probably not readable by the other. When that
+  happens, the runner recovers from the visible transcript with a summarized
+  rollover, which costs an extra request. Prefer one provider for a long
+  investigation and treat the other as an emergency backup. This has not been
+  verified against both services.
 
-Five total submission attempts are allowed by default. Retryable service
-errors, connection failures before the request is sent, malformed/empty
-response errors, and submission-level `DeploymentNotFound` 404s advance to the
-next target. Authentication, authorization, refusals, and ordinary invalid
-requests remain terminal. Ambiguous submissions—read timeouts or disconnects
-after sending, gateway HTTP 502/504, interruptions, or a success response
-without a readable ID—stop as `submission_unknown` and are never resubmitted
-automatically. GPT-6 and GPT-5.6 use `pro`/`max`; GPT-5.4 Pro uses `xhigh`
-without unsupported reasoning mode/context options. Polling an accepted job
-never changes resources or resubmits the job, even if polling retries are
-exhausted.
+Each journaled job records its provider. `resume`, `cancel`, and `reconcile`
+contact a job only through a listed method of that provider; otherwise they
+report which `--auth` value to use. `cancel` and `reconcile` report a refused
+endpoint, missing credential, or failed sign-in for that job alone and still
+process the others; they then exit with 1 so scripts notice (0 means every job
+was handled, 2 means the command itself failed). Because OpenAI hides responses from other projects and
+deletes finished background responses after about 10 minutes, an HTTP 404 for
+an OpenAI job turns it into an unknown submission instead of marking it
+finished; resolve it with `reconcile` as described under Troubleshooting.
 
-The values above last only for the current PowerShell process. If you automate
-them, use an operating-system, CI, or cloud configuration store outside the
-repository. Do not create a tracked setup script or `.env` file.
+## Azure OpenAI
 
-An already-running terminal or agent process does not inherit user-level
-environment variables added later. Restart that terminal or agent after
-persisting `AZURE_OPENAI_ENDPOINT`, or set it explicitly in the current
-PowerShell session.
+### Prerequisites
 
-To persist the new endpoint settings for future Windows processes:
+1. An Azure OpenAI resource with a `gpt-6-astra` deployment. Fallback
+   deployments (`gpt-5.6-sol` and `gpt-5.4-pro` by default) are optional but
+   recommended.
+2. Its v1 base endpoint, such as `https://<resource>.openai.azure.com/openai/v1/`,
+   or a full preview Responses URL such as
+   `https://<resource>.openai.azure.com/openai/responses?api-version=2025-04-01-preview`.
+   For preview URLs the runner keeps `api-version` for creation and polling.
+   No other query parameters, embedded credentials, or fragments are accepted.
+3. For Entra ID: an identity with a data-plane role on each resource, normally
+   **Cognitive Services OpenAI User** at resource or deployment scope.
+4. Python dependencies from `scripts/requirements.txt`.
 
-```powershell
-[Environment]::SetEnvironmentVariable("AZURE_OPENAI_GPT6_ENDPOINT", $env:AZURE_OPENAI_GPT6_ENDPOINT, "User")
-[Environment]::SetEnvironmentVariable("AZURE_OPENAI_GPT6_BACKUP_ENDPOINT", $env:AZURE_OPENAI_GPT6_BACKUP_ENDPOINT, "User")
-[Environment]::SetEnvironmentVariable("AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT", $env:AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT, "User")
-```
+A single resource needs only `AZURE_OPENAI_ENDPOINT`.
 
-Keep the existing fallback endpoint configured as well. Restart terminals and
-agents after changing user-level settings; existing processes do not reload them.
+### Model chain
+
+1. The primary deployment (`gpt-6-astra`, or `AZURE_OPENAI_DEPLOYMENT` /
+   `--deployment`) on `AZURE_OPENAI_GPT6_ENDPOINT`, or else on
+   `AZURE_OPENAI_ENDPOINT`.
+2. Optionally the same model on `AZURE_OPENAI_GPT6_BACKUP_ENDPOINT`, for
+   example in another region. Set `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` or
+   `--backup-deployment` if its deployment name differs.
+3. Each deployment in `AZURE_OPENAI_FALLBACK_DEPLOYMENTS` (default
+   `gpt-5.6-sol,gpt-5.4-pro`; `none` disables fallbacks) on
+   `AZURE_OPENAI_FALLBACK_ENDPOINT`, else `AZURE_OPENAI_ENDPOINT`, else the
+   primary resource. The list must not include `gpt-6-astra`.
+
+An explicit `--deployment` that names a fallback deployment uses the fallback
+resource and starts at that point in the chain. Deployment names must exist
+on the resource; a submission-level `DeploymentNotFound` moves on to the next
+model. Deployment names starting with `gpt-5.4` (such as `gpt-5.4-pro-eu`)
+receive the GPT-5.4 Pro reasoning settings described below. The GPT-6 backup
+deployment name applies only when the primary is the configured GPT-6
+deployment, so an explicitly chosen other model is never answered by GPT-6.
+
+## OpenAI API
+
+Requests go to `OPENAI_BASE_URL` (default `https://api.openai.com/v1/`). The
+chain is `gpt-6-astra` (or `--deployment`), then `OPENAI_FALLBACK_MODELS`
+(default `gpt-5.6-sol,gpt-5.4-pro`; `none` disables fallbacks). A model your
+project cannot use (`model_not_found`, returned as HTTP 403 or 404) moves on to
+the next model. The primary model name applies to every listed method, so when
+you combine providers keep Azure deployment names equal to the model names.
+
+## Retries and attempts
+
+Each logical request gets one submission attempt per model in its chain, at
+least five and at most ten; `--max-attempts` sets a fixed number from 1 to 10.
+Retryable service errors, connection failures before the request is sent,
+malformed or empty responses, and submission-level `DeploymentNotFound` or
+`model_not_found` errors advance to the next model. Refusals and ordinary
+invalid requests stop immediately; sign-in failures stop unless another method
+is listed. Every new request starts at the top of the chain.
+
+Ambiguous submissions (read timeouts or disconnects after sending, gateway HTTP
+502/504, interruptions, or a success response without a readable ID) stop as
+`submission_unknown` and are never resubmitted automatically. Polling an
+accepted job never changes resources or resubmits it.
+
+GPT-6 Astra and GPT-5.6 Sol use `pro` mode and `max` effort. GPT-5.4 Pro uses
+`xhigh` and omits reasoning mode and context options it does not support.
 
 ## Managed identity
 
 In Azure, enable a system-assigned or user-assigned managed identity and grant
-it the required data-plane role on every resource. Configure the endpoint
-variables above in the service environment. `DefaultAzureCredential`
-will select the managed identity automatically.
-
-For a user-assigned managed identity, supply `AZURE_CLIENT_ID` through the
-service configuration. A client ID identifies the managed identity; it is not
-a secret, but it still should remain environment-specific rather than committed
-here.
+it the data-plane role on every resource. Configure the endpoint variables in
+the service environment; `DefaultAzureCredential` selects the managed identity
+automatically. For a user-assigned identity, also set `AZURE_CLIENT_ID`. A
+client ID is not a secret, but it belongs in environment configuration rather
+than in this repository.
 
 ## CI and workload identity
 
 Prefer workload identity federation or the CI platform's Azure login action.
-Store endpoint and deployment values as protected environment configuration.
-Let the platform obtain short-lived Entra tokens. Never:
+Store endpoints and deployment names as protected environment configuration,
+and let the platform obtain short-lived Entra ID tokens. Never:
 
 - commit a token, API key, client secret, certificate, or credential file;
-- put credentials in the endpoint URL;
+- put credentials in an endpoint URL;
 - print access tokens in logs;
-- commit `.env`, `*.local`, `*.key`, `*.pem`, or `*.pfx` files;
+- commit a filled-in `.env`, `*.local`, `*.key`, `*.pem`, or `*.pfx` file;
 - commit generated transcripts without reviewing their prompts and outputs.
 
 The repository `.gitignore` excludes common local configuration and credential
-artifacts, but ignore rules are not a substitute for secret scanning.
+files, but ignore rules are not a substitute for secret scanning.
 
-## Command-line override
+## Command-line overrides
 
-`--endpoint`, `--backup-endpoint`, and `--fallback-endpoint` override the
-corresponding resources for an isolated run:
+`--endpoint` replaces the primary endpoint of the selected provider: the Azure
+primary resource, or the OpenAI base URL with `--auth openai-key`. It needs an
+`--auth` list for a single provider (or a detected one), so it can never be
+read as the other provider's endpoint. `--backup-endpoint` and
+`--fallback-endpoint` replace Azure resources only. An endpoint option without
+`--auth` or `DEEP_THINK_AUTH` selects Azure.
 
-```powershell
-python "scripts\deep_think.py" ask `
-  --endpoint (Read-Host "Azure OpenAI v1 endpoint") `
-  --project "project-slug" `
-  --prompt "Audit the construction."
+```bash
+python3 scripts/deep_think.py ask --auth openai-key \
+  --endpoint https://api.openai.com/v1/ \
+  --project project-slug --prompt "Audit the construction."
 ```
 
-Prefer the environment variable for routine use so the endpoint is not copied
-into shell scripts or command history.
+Prefer settings for routine use so endpoints stay out of shell history.
 
 ## Polling and service-error recovery
 
@@ -151,12 +213,10 @@ request journal keeps its ID and original resource, so continue polling it with
 For an existing project whose accepted jobs repeatedly finish with
 `status="failed"` and `error.code="server_error"`, explicitly enable recovery:
 
-```powershell
-python "scripts\deep_think.py" ask `
-  --project "project-slug" `
-  --prompt "Continue the investigation." `
-  --poll-timeout 7200 `
-  --recover-service-errors
+```bash
+python3 scripts/deep_think.py ask --project project-slug \
+  --prompt "Continue the investigation." \
+  --poll-timeout 7200 --recover-service-errors
 ```
 
 The normal ordered failover policy runs first. After the submission-attempt
@@ -181,61 +241,126 @@ the service's error message (including any support correlation ID).
 Capture stderr when investigating failures; full prompts, encrypted context,
 and credentials are not included in these added request diagnostics.
 A `server_error` is not proof of context exhaustion. This recovery is a
-mitigation, not a diagnosis or guarantee that Azure will accept the next request.
+mitigation, not a diagnosis or guarantee that the service will accept the next
+request.
+
+## Upgrading older projects
+
+Projects whose primary model is a default or configured fallback deployment
+(from `AZURE_OPENAI_FALLBACK_DEPLOYMENTS` or `OPENAI_FALLBACK_MODELS`) adopt
+GPT-6 Astra on their next successful default turn without discarding history.
+An explicit `--deployment` keeps an older primary. Remove an old
+`AZURE_OPENAI_DEPLOYMENT` override, or set it to `gpt-6-astra`, to use the new
+default.
+
+Earlier releases tried a site-specific GPT-5.6 deployment in the default
+fallback chain. If a project's primary deployment is no longer in the default
+chain, list it in `AZURE_OPENAI_FALLBACK_DEPLOYMENTS`. The project then upgrades
+to GPT-6 as before, and an explicit `--deployment` for it routes to the
+fallback resource.
 
 ## Validate configuration
 
-Confirm that the required setting exists without printing its value:
+Check which settings are present without printing their values.
 
-```powershell
-if (-not $env:AZURE_OPENAI_GPT6_ENDPOINT -or -not $env:AZURE_OPENAI_GPT6_BACKUP_ENDPOINT) {
-  throw "Both GPT-6 endpoints must be configured for regional failover."
-}
-az account show --output none
-python "scripts\deep_think.py" --help
+macOS or Linux:
+
+```bash
+for name in DEEP_THINK_AUTH OPENAI_API_KEY AZURE_OPENAI_ENDPOINT \
+    AZURE_OPENAI_GPT6_ENDPOINT AZURE_OPENAI_API_KEY; do
+  if [ -n "${!name}" ]; then echo "$name set"; else echo "$name -"; fi
+done
+az account show --output none   # Entra ID only
+python3 scripts/deep_think.py --help
 ```
 
-When installed as a repository skill, prefix paths with
-`.github\skills\deep-think\`.
+Windows PowerShell:
+
+```powershell
+"DEEP_THINK_AUTH", "OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT",
+  "AZURE_OPENAI_GPT6_ENDPOINT", "AZURE_OPENAI_API_KEY" |
+  ForEach-Object { "{0} {1}" -f $_, $(if ([Environment]::GetEnvironmentVariable($_)) { "set" } else { "-" }) }
+az account show --output none   # Entra ID only
+python scripts\deep_think.py --help
+```
+
+These checks see the shell environment only; the runner also reads the env
+file. When installed as a skill, prefix paths with the skill folder, for
+example `~/.agents/skills/deep-think/`.
 
 ## Troubleshooting
 
-- **Missing endpoint:** set `AZURE_OPENAI_GPT6_ENDPOINT` or pass `--endpoint`.
-- **Endpoint exists at user scope but the runner says it is missing:** restart
-  the terminal or agent process so it inherits the updated environment.
-- **HTTP 401:** refresh `az login` or check the managed/workload identity.
+- **Missing endpoint:** set `AZURE_OPENAI_ENDPOINT` (or
+  `AZURE_OPENAI_GPT6_ENDPOINT`) in the env file or environment, or pass
+  `--endpoint`. To use OpenAI instead, set `OPENAI_API_KEY` or
+  `DEEP_THINK_AUTH=openai-key`.
+- **A setting seems ignored:** a non-empty variable set in the shell overrides
+  the env file. Check that `DEEP_THINK_ENV_FILE` is unset or points to the
+  intended file, and restart the agent after changing user-level variables.
+- **Env file error:** the message names the file, line, and variable. Use
+  `NAME=value` lines and only `AZURE_*`, `OPENAI_*`, or `DEEP_THINK_*` names.
+- **HTTP 401:** refresh `az login`, check the managed or workload identity, or
+  check the API key.
 - **HTTP 403:** verify the identity's data-plane role and resource scope.
 - **Deployment not found:** set `AZURE_OPENAI_DEPLOYMENT` to the deployment
   name, not the base model name unless they are identical. For the GPT-6
-  backup, use `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` or `--backup-deployment`.
-  An available model listing does not prove a deployment with that name exists.
-- **HTTP 429 or transient errors:** the runner advances through the ordered
-  chain above and starts the next logical request on the primary deployment.
+  backup, use `AZURE_OPENAI_GPT6_BACKUP_DEPLOYMENT` or `--backup-deployment`;
+  for older models, `AZURE_OPENAI_FALLBACK_DEPLOYMENTS`. An available model
+  listing does not prove a deployment with that name exists.
+- **HTTP 429 or transient errors:** the runner advances through the chain and
+  starts the next request at the top.
 - **Project is already locked:** run `deep_think.py status --project SLUG`. A
   lock held by a running process means wait. Locks left by dead processes are
   recovered automatically; a lock from another host needs `reconcile
   --release-lock` after you confirm that process exited. Never delete it.
-- **Submission outcome is unknown:** Azure may have accepted the request without
-  returning its ID. Search Azure telemetry using the attempt time, deployment,
-  resource, and request SHA-256 shown by `status`, then run `reconcile --attempt
-  ATTEMPT --response-id ID`, or `reconcile --confirm-no-remote-job --reason
-  TEXT` once you have verified that no job remains active.
+- **Submission outcome is unknown:** the service may have accepted the request
+  without returning its ID. Search Azure telemetry or the OpenAI dashboard logs
+  using the attempt time, deployment, resource, and request SHA-256 shown by
+  `status`, then run `reconcile --attempt ATTEMPT --response-id ID`, or
+  `reconcile --confirm-no-remote-job --reason TEXT` once you have verified that
+  no job remains active.
 - **Unfinished turn blocks a new prompt:** run `resume` to finish it, `cancel`
   to stop running jobs, or `reconcile --abandon-turn --reason TEXT`.
 - **Recorded resource is not a configured endpoint:** the journal names an
-  endpoint that is not configured for this run, so the runner will not send
-  Azure credentials to it. If that endpoint is legitimate (for example, you
-  changed configuration while a job ran), pass it explicitly with `--endpoint`.
+  endpoint that is not configured for that provider, so the runner will not send
+  credentials to it. If the job used the other provider, rerun with the
+  `--auth` value the message names. If the endpoint is legitimate (for example,
+  you changed configuration while a job ran), pass it explicitly with
+  `--endpoint` together with an `--auth` list for that provider only.
+- **Resource is configured for the other provider:** the endpoint matches a
+  setting of the other provider (such as `OPENAI_BASE_URL`), so it is never
+  used with this provider's credentials. Rerun with the `--auth` value the
+  message names.
+- **OpenAI job not found (HTTP 404):** OpenAI hides responses from other
+  projects and deletes finished background responses after about 10 minutes, so
+  the job became an unknown submission. Check that `OPENAI_API_KEY`,
+  `OPENAI_PROJECT_ID`, and `OPENAI_ORG_ID` match the project that ran it, then
+  run `reconcile --attempt ATTEMPT --response-id ID`, or `reconcile
+  --confirm-no-remote-job --reason TEXT` after confirming that nothing is
+  running.
+- **Job was submitted through another provider:** `status` lists each job's
+  `provider`, and its next steps include `--auth openai-key` for OpenAI jobs.
+  Rerun `resume`, `cancel`, or `reconcile` with an `--auth` list that includes
+  that provider.
+- **Refusing to send credentials to another provider's host:** an OpenAI key
+  was about to reach an Azure host, or Azure credentials an `openai.com` host.
+  Correct `--auth`, the endpoint, or `OPENAI_BASE_URL`. For an Azure resource
+  with a key, use `--auth azure-key` and `AZURE_OPENAI_API_KEY`.
 - **Request journal has an invalid artifact name:** the journal names a file
   outside its `requests` directory and may have been tampered with. Inspect it
   before continuing; the runner will not read or delete such paths.
 - **Old model still selected:** clear an old `AZURE_OPENAI_DEPLOYMENT`
-  override or set it to `gpt-6-astra`, then restart the terminal/agent.
+  override or set it to `gpt-6-astra`, then restart the terminal or agent.
 - **Credential chain selects the wrong account:** inspect `az account show`,
-  choose the intended subscription, and log in again. Do not work around the
-  issue by adding an API key.
+  choose the intended subscription, and log in again.
+- **An API key is required:** `azure-key` or `openai-key` was selected but the
+  matching key variable is empty. Add it to the env file or the agent's
+  environment; never paste keys into prompts or command arguments.
+- **Wrong method selected:** an Azure endpoint takes precedence over
+  `OPENAI_API_KEY`, and an Azure key is tried before Entra ID. Set
+  `DEEP_THINK_AUTH` (for example `openai-key` or `entra`) or pass `--auth`.
 - **`AzureCliCredential: Failed to invoke the Azure CLI`:** check how long
   `az account get-access-token --scope https://ai.azure.com/.default --output
   none` takes. The runner allows developer-credential subprocesses 60 seconds
-  (the Azure SDK default is 10). Authentication failures are recorded as not
-  sent and are never retried against another target.
+  (the Azure SDK default is 10). Sign-in failures are recorded as not sent;
+  they move to the next listed method, if any, and otherwise stop.

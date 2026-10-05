@@ -141,7 +141,7 @@ class PollDeadlineTests(unittest.TestCase):
             [make_status_error(500, "server_error")],
         )
         with self.assertRaisesRegex(
-            runner.DeepThinkError, "job-lost.*gpt-6-astra.*target 1/4"
+            runner.DeepThinkError, "job-lost.*gpt-6-astra.*target 1/3"
         ):
             runner.request_response(
                 client,
@@ -244,7 +244,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         for value in (
             "job-service",
             "gpt-6-astra",
-            "target 1/4",
+            "target 1/3",
             "25014",
             "wfr-test",
             "request_bytes=",
