@@ -169,7 +169,13 @@ JOURNAL_TEXT_FIELDS = (
     "resource",
     "provider",
     "deployment",
+    "status",
+    "state_sha256",
+    "logical_sha256",
+    "item_id",
+    "kind",
 )
+JOURNAL_LIST_FIELDS = ("attempt_ids", "item_ids")
 
 
 class DeepThinkError(RuntimeError):
@@ -642,10 +648,14 @@ def create_client(
     if auth not in {"entra", "azure-key", "openai-key"}:
         raise DeepThinkError(f"Unknown auth mode {auth!r}.")
     if auth != "entra" and (not isinstance(api_key, str) or not api_key.strip()):
-        variable = "AZURE_OPENAI_API_KEY" if auth == "azure-key" else "OPENAI_API_KEY"
+        variable = (
+            "AZURE_OPENAI_API_KEY (or a resource-specific key variable)"
+            if auth == "azure-key"
+            else "OPENAI_API_KEY"
+        )
         raise MissingCredentialError(
             f"An API key is required for {auth} authentication. Set {variable} "
-            "(or a resource-specific key variable) in the environment."
+            "in the environment or the env file."
         )
     if auth == "openai-key":
         base_url = _validate_openai_endpoint(endpoint)
@@ -1063,15 +1073,17 @@ def _record_accepted(journal, attempt_id, response_id, status):
         )
     except DeepThinkError as error:
         raise DeepThinkError(
-            f"Azure accepted response {response_id} (attempt {attempt_id}), but "
-            f"the request journal could not record it: {error} The job may still "
+            f"The service accepted response {response_id} (attempt {attempt_id}), "
+            f"but the request journal could not record it: {error} The job may still "
             "be running. Once the journal is writable, run `reconcile --attempt "
             f"{attempt_id} --response-id {response_id}`."
         ) from error
 
 
 def _submission_unknown_message(purpose, target, attempt_id, reason):
+    flag = ""
     if getattr(target, "provider", "azure") == "openai":
+        flag = " --auth openai-key"
         where = (
             "OpenAI may already be running this request. Find it in the OpenAI "
             "dashboard logs"
@@ -1083,8 +1095,8 @@ def _submission_unknown_message(purpose, target, attempt_id, reason):
         f"{attempt_id}, deployment {target.deployment}, resource "
         f"{target.resource or 'configured client'}): {reason}. No replacement "
         "request was sent: the Responses API has no idempotency key, so "
-        f"{where} and run `reconcile --attempt ATTEMPT --response-id ID`, or, "
-        "after verifying that no job remains active, run `reconcile "
+        f"{where} and run `reconcile{flag} --attempt ATTEMPT --response-id ID`, "
+        f"or, after verifying that no job remains active, run `reconcile{flag} "
         "--confirm-no-remote-job --reason TEXT`."
     )
 
@@ -1592,7 +1604,8 @@ def _request_response(
             if retryable_codes:
                 request_bytes = _canonical_json_text(attempt_request).encode("utf-8")
                 reason = (
-                    f"Azure response {status} "
+                    f"{SERVICE_LABELS.get(active.provider, 'Azure')} response "
+                    f"{status} "
                     f"({', '.join(sorted(retryable_codes))}); "
                     f"response_id={_response_id(response)}; {target_label}; "
                     f"max_output_tokens={attempt_request.get('max_output_tokens')}; "
@@ -1629,15 +1642,19 @@ def _request_response(
                 " (" + ", ".join(sorted(response_codes)) + ")" if response_codes else ""
             )
             raise DeepThinkError(
-                f"{purpose.capitalize()} request failed without retry: Azure "
+                f"{purpose.capitalize()} request failed without retry: "
+                f"{SERVICE_LABELS.get(active.provider, 'Azure')} "
                 f"response {status}{code_text}: {response_message}"
             )
         except MalformedResponseError as error:
             journal.append("discarded", attempt_id=attempt_id, reason="malformed")
+            malformed = (
+                f"malformed {SERVICE_LABELS.get(active.provider, 'Azure')} response"
+            )
             if attempt >= max_attempts:
                 raise DeepThinkError(
                     f"{purpose.capitalize()} request failed after "
-                    f"{attempt} attempts: malformed Azure response"
+                    f"{attempt} attempts: {malformed}"
                 ) from error
             delay = _retry_delay(
                 None,
@@ -1646,7 +1663,7 @@ def _request_response(
                 max_delay,
                 random_value,
             )
-            retry_next("malformed Azure response", delay)
+            retry_next(malformed, delay)
             continue
 
     raise DeepThinkError(f"{purpose.capitalize()} request exhausted retries.")
@@ -2245,6 +2262,16 @@ def _read_journal(path):
                     f"{field!r} value. The journal may have been tampered with; "
                     "inspect it before continuing."
                 )
+        for field in JOURNAL_LIST_FIELDS:
+            value = record.get(field)
+            if value is not None and not (
+                isinstance(value, list) and all(isinstance(v, str) for v in value)
+            ):
+                raise DeepThinkError(
+                    f"Request journal {path} line {number} has an invalid "
+                    f"{field!r} value. The journal may have been tampered with; "
+                    "inspect it before continuing."
+                )
         records.append(record)
     return records, torn_tail
 
@@ -2285,7 +2312,14 @@ class JournalView:
         self._sequence = 0
         for record in records:
             self._sequence += 1
-            self._apply(record)
+            try:
+                self._apply(record)
+            except (TypeError, AttributeError, ValueError) as error:
+                raise DeepThinkError(
+                    f"Request journal record {self._sequence} could not be applied "
+                    f"({type(error).__name__}). The journal may have been tampered "
+                    "with; inspect it before continuing."
+                ) from error
 
     def _apply(self, record):
         event = record.get("event")
@@ -2611,7 +2645,12 @@ class RequestJournal:
                 raise SubmissionUnknownError(
                     _submission_unknown_message(
                         attempt["purpose"] or "request",
-                        RouteTarget(attempt["deployment"], None, attempt["resource"]),
+                        RouteTarget(
+                            attempt["deployment"],
+                            None,
+                            attempt["resource"],
+                            provider=_attempt_provider(attempt),
+                        ),
                         attempt["attempt_id"],
                         attempt["reason"]
                         or "the writer stopped before recording the outcome",
@@ -3532,7 +3571,12 @@ def _begin_journaled_turn(
         raise SubmissionUnknownError(
             _submission_unknown_message(
                 attempt["purpose"] or "request",
-                RouteTarget(attempt["deployment"], None, attempt["resource"]),
+                RouteTarget(
+                    attempt["deployment"],
+                    None,
+                    attempt["resource"],
+                    provider=_attempt_provider(attempt),
+                ),
                 attempt["attempt_id"],
                 attempt["reason"] or "the writer stopped before recording the outcome",
             )
@@ -4480,11 +4524,23 @@ def cancel_requests(
                 if observed_kind == "not_found":
                     kind, value = observed_kind, observed
             if kind != "response":
+                gone = (
+                    kind == "not_found"
+                    and attempt is not None
+                    and owner == "azure"
+                    and not attempt["attached_unverified"]
+                )
                 if kind == "not_found" and attempt is not None:
                     value = _record_not_found(journal, attempt, response_id)
-                results.append(
-                    {"response_id": response_id, "status": None, "error": value}
-                )
+                if gone:
+                    # The original Azure resource no longer has it: not running.
+                    results.append(
+                        {"response_id": response_id, "status": "gone", "note": value}
+                    )
+                else:
+                    results.append(
+                        {"response_id": response_id, "status": None, "error": value}
+                    )
                 continue
             status = _safe_response_status(value)
             journal.append(
@@ -4497,13 +4553,16 @@ def cancel_requests(
             results.append(
                 {"response_id": response_id, "status": status, "resource": resource}
             )
+    failed = sum(1 for result in results if "error" in result)
     if not results:
         results_message = "No active journaled responses to cancel."
     else:
-        results_message = f"Processed {len(results)} cancellation request(s)."
+        results_message = f"Processed {len(results)} cancellation request(s)"
+        results_message += f"; {failed} failed." if failed else "."
     return {
         "message": results_message,
         "results": results,
+        "failed": failed,
         "status": project_status(root, project),
     }
 
@@ -4568,6 +4627,8 @@ def _record_observed_response(journal, attempt, response):
 
 
 def _refresh_active_attempts(journal, factories, clients, actions):
+    """Observe every active job; return how many could not be observed."""
+    failed = 0
     view = journal.view()
     for attempt in view.attempts.values():
         if view.attempt_state(attempt) != "active":
@@ -4576,6 +4637,7 @@ def _refresh_active_attempts(journal, factories, clients, actions):
         mismatch = _provider_mismatch(attempt, factories)
         if mismatch is not None:
             actions.append(f"{response_id}: not observed; {mismatch}")
+            failed += 1
             continue
         owner = _attempt_provider(attempt)
         kind, value = _remote_call(
@@ -4588,11 +4650,15 @@ def _refresh_active_attempts(journal, factories, clients, actions):
         )
         if kind == "not_found":
             actions.append(_record_not_found(journal, attempt, response_id))
+            # Only a 404 from the original Azure resource settles the job.
+            failed += owner != "azure" or attempt["attached_unverified"]
         elif kind == "error":
             actions.append(f"{response_id}: could not observe status ({value})")
+            failed += 1
         else:
             _status, note = _record_observed_response(journal, attempt, value)
             actions.append(f"{response_id}: {note}")
+    return failed
 
 
 def reconcile_project(
@@ -4628,6 +4694,7 @@ def reconcile_project(
         )
     project_dir = _existing_project_dir(root, project)
     actions = []
+    failed = 0
     clients = {}
     with _project_lock(
         root, project, command="reconcile", release_unverifiable=release_lock
@@ -4710,7 +4777,8 @@ def reconcile_project(
                     )
                 else:
                     actions.append(f"{response_id}: {status or value}")
-        _refresh_active_attempts(journal, factories, clients, actions)
+                    failed += kind == "error"
+        failed += _refresh_active_attempts(journal, factories, clients, actions)
         view = journal.view()
         if confirm_no_remote_job:
             attempts = [
@@ -4759,7 +4827,11 @@ def reconcile_project(
                 )
                 journal.release_turn_artifacts(turn["turn_id"])
                 actions.append(f"abandoned unfinished turn {turn['turn_id']}")
-    return {"actions": actions, "status": project_status(root, project)}
+    return {
+        "actions": actions,
+        "failed": failed,
+        "status": project_status(root, project),
+    }
 
 
 def _add_project_arguments(parser):
@@ -5025,12 +5097,12 @@ def _configured_client_factories(methods, *, on_switch=None, on_unavailable=None
                     failures.append((method, error))
             if not clients:
                 raise failures[0][1]
-            for method, error in failures:
-                expected = isinstance(error, MissingCredentialError)
+            for method, failure in failures:
+                expected = isinstance(failure, MissingCredentialError)
                 if not expected and method not in reported:
                     reported.add(method)
                     if on_unavailable is not None:
-                        on_unavailable(method, error)
+                        on_unavailable(method, failure)
             if len(clients) == 1:
                 return clients[0][1]
             return AuthFallbackClient(clients, on_switch=on_switch)
@@ -5128,20 +5200,31 @@ def _provider_router(args, deployment, provider, client_factory, endpoint):
     )
 
 
-def _router_from_args(args, deployment, client_factories):
-    """Chain each provider's models in --auth order; later providers are backups."""
+def _router_from_args(args, deployment, client_factories, *, on_unavailable=None):
+    """Chain each provider's models in --auth order; later providers are backups.
+
+    A backup provider without a credential is skipped (with a note) rather
+    than blocking the primary provider.
+    """
     providers = _method_providers(_resolve_methods(args))
     if not isinstance(client_factories, Mapping):
         client_factories = dict.fromkeys(providers, client_factories)
     targets, clients = [], {}
     for provider in providers:
-        router = _provider_router(
-            args,
-            deployment,
-            provider,
-            client_factories[provider],
-            args.endpoint if provider == providers[0] else None,
-        )
+        try:
+            router = _provider_router(
+                args,
+                deployment,
+                provider,
+                client_factories[provider],
+                args.endpoint if provider == providers[0] else None,
+            )
+        except MissingCredentialError as error:
+            if provider == providers[0]:
+                raise
+            if on_unavailable is not None:
+                on_unavailable(provider, error)
+            continue
         targets.extend(router.targets)
         clients.update(router._clients)
     return DeploymentRouter(
@@ -5357,6 +5440,12 @@ def main(
             f"({_redact_secrets(error)}); using the other listed sign-in methods.\n"
         )
 
+    def report_unavailable_provider(provider, error):
+        stderr.write(
+            f"deep-think: backup provider {PROVIDER_LABELS[provider]} is "
+            f"unavailable ({_redact_secrets(error)}); continuing without it.\n"
+        )
+
     try:
         if args.command != "status":
             methods = _resolve_methods(args)
@@ -5404,7 +5493,12 @@ def main(
         elif args.command == "resume":
             report = None
             result = resume_turn(
-                lambda deployment: _router_from_args(args, deployment, factories),
+                lambda deployment: _router_from_args(
+                    args,
+                    deployment,
+                    factories,
+                    on_unavailable=report_unavailable_provider,
+                ),
                 root=args.root,
                 project=args.project,
                 max_attempts=args.max_attempts,
@@ -5418,7 +5512,12 @@ def main(
             report = None
             prompt = _prompt_from_args(args, stdin)
             result = run_turn(
-                _router_from_args(args, args.deployment, factories),
+                _router_from_args(
+                    args,
+                    args.deployment,
+                    factories,
+                    on_unavailable=report_unavailable_provider,
+                ),
                 root=args.root,
                 project=args.project,
                 title=args.title,
@@ -5444,7 +5543,8 @@ def main(
 
     if report is not None:
         stdout.write(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-        return 0
+        # 1 means the report lists jobs that could not be handled.
+        return 1 if report.get("failed") else 0
     stdout.write(result.text.rstrip() + "\n")
     stderr.write(f"Transcript: {result.transcript_path}\n")
     return 0

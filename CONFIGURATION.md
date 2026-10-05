@@ -41,8 +41,8 @@ agent's environment is safer still.
 ## Choosing methods and backups
 
 `--auth` or `DEEP_THINK_AUTH` takes a comma-separated list of distinct methods
-in priority order, for example `entra,openai-key`. Without either, one method
-is detected:
+in priority order, for example `entra,openai-key`. Without either, methods are
+detected:
 
 1. If an `--endpoint`, `--backup-endpoint`, or `--fallback-endpoint` option or
    an Azure endpoint variable is set: `azure-key,entra` when an Azure key
@@ -82,7 +82,8 @@ Each journaled job records its provider. `resume`, `cancel`, and `reconcile`
 contact a job only through a listed method of that provider; otherwise they
 report which `--auth` value to use. `cancel` and `reconcile` report a refused
 endpoint, missing credential, or failed sign-in for that job alone and still
-process the others. Because OpenAI hides responses from other projects and
+process the others; they then exit with 1 so scripts notice (0 means every job
+was handled, 2 means the command itself failed). Because OpenAI hides responses from other projects and
 deletes finished background responses after about 10 minutes, an HTTP 404 for
 an OpenAI job turns it into an unknown submission instead of marking it
 finished; resolve it with `reconcile` as described under Troubleshooting.

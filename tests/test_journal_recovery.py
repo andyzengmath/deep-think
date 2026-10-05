@@ -1004,7 +1004,7 @@ class ReviewRegressionTests(ProjectFixture):
                 stderr=stderr,
             )
             # The failure is reported for the job; nothing else is changed.
-            self.assertEqual(code, 0, command)
+            self.assertEqual(code, 1, command)
             self.assertIn("authentication failed", stdout.getvalue())
             self.assertIn("no remote state was changed", stdout.getvalue())
         self.assertEqual(
@@ -1278,11 +1278,11 @@ class JournalTrustTests(ProjectFixture):
         with mock.patch.dict("os.environ", configured, clear=True):
             # Recovery commands report the refusal per job; resume stops.
             code, output, stderr = self.cli("cancel", client_factory=factory)
-            self.assertEqual(code, 0, stderr)
+            self.assertEqual(code, 1, stderr)
             [result] = json.loads(output)["results"]
             self.assertIn("not a configured endpoint", result["error"])
             code, output, stderr = self.cli("reconcile", client_factory=factory)
-            self.assertEqual(code, 0, stderr)
+            self.assertEqual(code, 1, stderr)
             self.assertIn("not a configured endpoint", output)
             code, _, stderr = self.cli("resume", client_factory=factory)
             self.assertEqual(code, 2)

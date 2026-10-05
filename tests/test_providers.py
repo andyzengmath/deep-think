@@ -670,11 +670,11 @@ class CrossProviderRecoveryTests(ProjectFixture):
             self.assertEqual(code, 2, stdout)
             self.assertIn(flag, stderr)
         elif arguments[0] == "cancel":
-            self.assertEqual(code, 0, stderr)
+            self.assertEqual(code, 1, stderr)
             [result] = json.loads(stdout)["results"]
             self.assertIn(flag, result["error"])
         else:
-            self.assertEqual(code, 0, stderr)
+            self.assertEqual(code, 1, stderr)
             self.assertTrue(
                 any(flag in action for action in json.loads(stdout)["actions"]),
                 stdout,
@@ -922,7 +922,7 @@ class ReviewRegressionTests(ProviderProjectFixture):
                 "cancel",
                 factory=lambda resource: NotFoundClient(resource, log),
             )
-        self.assertEqual(code, 0, stderr)
+        self.assertEqual(code, 1, stderr)
         [result] = json.loads(stdout)["results"]
         self.assertIn("unknown", result["error"])
         status = self.status()
@@ -1331,8 +1331,10 @@ class ReviewRoundTwoTests(ProviderProjectFixture):
         }
         with mock.patch.dict("os.environ", environment, clear=True):
             code, stdout, stderr = self.cli("cancel", factory=factory)
-        self.assertEqual(code, 0, stderr)
-        results = {item["response_id"]: item for item in json.loads(stdout)["results"]}
+        self.assertEqual(code, 1, stderr)
+        report = json.loads(stdout)
+        self.assertEqual(report["failed"], 1)
+        results = {item["response_id"]: item for item in report["results"]}
         self.assertEqual(results["resp-job"]["status"], "cancelled")
         self.assertIn("API key", results["resp-openai"]["error"])
         self.assertEqual(log, [(AZURE_V1, "cancel", "resp-job")])
@@ -1367,6 +1369,93 @@ class ReviewRoundTwoTests(ProviderProjectFixture):
                 purpose="answer",
                 sleep=lambda _delay: None,
             )
+
+
+class FinalReviewTests(ProviderProjectFixture):
+    """Regressions for the final review of the multi-provider change."""
+
+    def openai_router(self, client):
+        target = self.runner.RouteTarget(
+            "gpt-6-astra", client, OPENAI_V1, "primary", "openai"
+        )
+        return self.runner.DeploymentRouter([target], provider="openai")
+
+    def test_unknown_openai_submissions_keep_openai_guidance(self):
+        self.seed()
+        gateway = make_status_error(502, "bad_gateway")
+        with self.assertRaises(self.runner.SubmissionUnknownError) as first:
+            self.ask(self.openai_router(FakeClient([gateway])))
+        with self.assertRaises(self.runner.SubmissionUnknownError) as second:
+            self.ask(self.openai_router(FakeClient([])))
+        for raised in (first, second):
+            message = str(raised.exception)
+            self.assertIn("OpenAI dashboard", message)
+            self.assertIn("reconcile --auth openai-key", message)
+            self.assertNotIn("Azure telemetry", message)
+
+    def test_openai_response_failures_are_labelled_openai(self):
+        failed = FakeResponse(
+            "resp-failed",
+            "",
+            status="failed",
+            error=SimpleNamespace(code="server_error", message="Unavailable."),
+        )
+        with self.assertRaisesRegex(self.runner.DeepThinkError, "OpenAI response"):
+            self.runner.request_response(
+                self.openai_router(FakeClient([failed])),
+                {"model": "gpt-6-astra", "input": "Q."},
+                purpose="answer",
+                max_attempts=1,
+                sleep=lambda _delay: None,
+            )
+
+    def test_tampered_journal_values_are_reported_not_crashing(self):
+        for field, value in (
+            ("status", ["completed"]),
+            ("attempt_ids", 5),
+            ("state_sha256", ["x"]),
+        ):
+            with self.subTest(field=field):
+                self.tearDown()
+                self.setUp()
+                self.seed()
+                record = {
+                    "schema": "deep-think-request-journal/v1",
+                    "recorded_at": "2026-10-04T00:00:00+00:00",
+                    "lock_id": None,
+                    "event": "poll_status",
+                    "attempt_id": "x",
+                    field: value,
+                }
+                path = self.project_dir / "requests" / "journal.jsonl"
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record) + "\n")
+                with self.assertRaisesRegex(self.runner.DeepThinkError, "tampered"):
+                    self.status()
+
+    def test_backup_provider_without_credentials_does_not_block_the_primary(self):
+        notes = []
+
+        def missing(_resource):
+            raise self.runner.MissingCredentialError("An API key is required.")
+
+        factories = {"azure": lambda _resource: object(), "openai": missing}
+        environment = {"AZURE_OPENAI_GPT6_ENDPOINT": AZURE_V1}
+        with mock.patch.dict("os.environ", environment, clear=True):
+            router = self.runner._router_from_args(
+                self.parse("ask", "--prompt", "Q.", "--auth", "entra,openai-key"),
+                "gpt-6-astra",
+                factories,
+                on_unavailable=lambda provider, _error: notes.append(provider),
+            )
+            self.assertEqual({t.provider for t in router.targets}, {"azure"})
+            self.assertEqual(notes, ["openai"])
+            with self.assertRaises(self.runner.MissingCredentialError):
+                self.runner._router_from_args(
+                    self.parse("ask", "--prompt", "Q.", "--auth", "openai-key,entra"),
+                    "gpt-6-astra",
+                    factories,
+                )
 
 
 if __name__ == "__main__":

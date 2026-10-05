@@ -44,7 +44,7 @@ your agent's own login does not authenticate model requests.
    - **Azure, API key:** the endpoint plus `AZURE_OPENAI_API_KEY` or a
      per-resource key variable.
 
-   One method is detected automatically. `DEEP_THINK_AUTH` or `--auth` lists
+   Methods are detected automatically. `DEEP_THINK_AUTH` or `--auth` lists
    methods (`entra`, `azure-key`, `openai-key`) in priority order, and later
    methods are backups. An explicit `--endpoint` selects Azure unless
    `--auth openai-key` is given. Remove a stale `AZURE_OPENAI_DEPLOYMENT`
@@ -194,10 +194,15 @@ python $runner reconcile --project "project-slug"
   jobs are still cancelled.
 - `reconcile` records each active job's current remote status and caches
   completed results for `resume`. Use `--attempt ATTEMPT --response-id ID` for
-  an ID found in Azure telemetry, `--confirm-no-remote-job --reason TEXT` only
+  an ID found in Azure telemetry or the OpenAI dashboard logs,
+  `--confirm-no-remote-job --reason TEXT` only
   after verifying that an unknown submission left no running job,
   `--abandon-turn --reason TEXT` to discard an unfinished turn with no running
   work, and `--release-lock` only for a lock whose owner cannot be verified.
+
+`cancel` and `reconcile` print a JSON report. They exit with 0 when every job
+was handled, 1 when the report lists jobs that could not be handled (check
+`failed` and each `error`), and 2 when the command itself failed.
 
 A dead writer process does not prove its Azure job ended. Locks left by dead
 processes are recovered automatically, but running, unknown, or completed but

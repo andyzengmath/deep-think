@@ -112,7 +112,7 @@ current folder.
 
 ## Sign-in methods and the backup plan
 
-Deep Think detects one sign-in method automatically:
+Deep Think detects sign-in methods automatically:
 
 1. If an Azure endpoint is configured, it uses the **Azure API key** when one
    is set, with **Microsoft Entra ID** as its backup, and Entra ID alone
@@ -212,9 +212,9 @@ each bounded research episode and before a handoff.
 - Keys are never accepted as command-line arguments, logged, or written to
   transcripts or journals. Azure keys are sent only in the `api-key` header.
 - Credentials never cross providers. OpenAI keys are refused for Azure hosts,
-  Azure credentials are refused for OpenAI hosts and for any endpoint you
-  configured for OpenAI, and each journaled job is recovered only through the
-  provider that accepted it.
+  Azure credentials are refused for OpenAI hosts and for any endpoint
+  configured only for OpenAI, and each journaled job is recovered only through
+  the provider that accepted it.
 - Transcripts and journals contain your prompts and answers. Review them
   before committing.
 
